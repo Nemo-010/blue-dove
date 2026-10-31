@@ -26,8 +26,12 @@ const platforms: Platform[] = [
     assets: [
       { label: 'x86_64', file: `${latest}-x86_64-linux.onelf`, note: 'portable, one file' },
       { label: 'aarch64', file: `${latest}-aarch64-linux.onelf`, note: 'portable, one file' },
-      { label: 'x86_64', file: `${latest}-x86_64.AppImage`, note: 'AppImage' },
-      { label: 'aarch64', file: `${latest}-aarch64.AppImage`, note: 'AppImage' },
+      ...(app.appimage
+        ? [
+            { label: 'x86_64', file: `${latest}-anylinux-x86_64.AppImage`, note: 'AppImage' },
+            { label: 'aarch64', file: `${latest}-anylinux-aarch64.AppImage`, note: 'AppImage' },
+          ]
+        : []),
       { label: 'x86_64', file: `${latest}-x86_64-linux.tar.xz`, note: 'archive' },
       { label: 'aarch64', file: `${latest}-aarch64-linux.tar.xz`, note: 'archive' },
     ],
@@ -36,14 +40,14 @@ const platforms: Platform[] = [
     os: 'macos',
     label: 'macOS',
     assets: [
-      { label: 'Apple silicon', file: `${latest}-aarch64-macos.tar.xz` },
-      { label: 'Intel', file: `${latest}-x86_64-macos.tar.xz` },
+      { label: 'Apple silicon', file: `${latest}-aarch64-macos.dmg` },
+      { label: 'Intel', file: `${latest}-x86_64-macos.dmg` },
     ],
   },
   {
     os: 'windows',
     label: 'Windows',
-    assets: [{ label: 'x86_64', file: `${latest}-x86_64-windows.zip` }],
+    assets: [{ label: 'x86_64', file: `${latest}-x86_64-windows.exe` }],
   },
 ]
 
