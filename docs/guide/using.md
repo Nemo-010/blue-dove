@@ -302,6 +302,25 @@ Selecting a track or pressing Next, Previous or Stop leaves the table
 showing the playing track, so the highlighted row is always what you
 hear.
 
+## Blind comparison
+
+To find out whether two files really sound different, select exactly two
+rows and pick **Playback > Blind Comparison**. The first of the two is
+labelled A and the second B, and the test plays them itself: **Play A**,
+**Play B** and **Play X**, where X is one of the two, drawn at random and
+never named until the answer is given.
+
+A test runs ten trials. Listen to X beside A and B, say whether X was A or
+B, and move on. Nine right answers out of ten mean you can tell the two
+apart, which is the level a test is usually held to: guessing reaches nine
+or more 1.1% of the time, while eight would be reached 5.5% of the time by
+guessing alone. The result gives the count, the chance and which side of
+that line it falls on.
+
+**Run Again** asks ten fresh trials between the same two tracks, drawn
+anew, so the second run is not a repeat of the first. The comparison keeps
+out of your playlists, and playing a row or opening the preview closes it.
+
 ## Volume
 
 The volume slider sits at the right-hand end of the control strip, below

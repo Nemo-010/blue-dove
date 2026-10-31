@@ -328,6 +328,7 @@ Modules, in `src/`:
 | `format.rs` | duration and count formatting |
 | `error.rs` | the `At` trait, which puts a path on a decoder's error |
 | `cli.rs` | the command line: flags, paths and the music directory they imply |
+| `abx.rs` | the blind comparison: ten trials, scored against guessing |
 
 Platform notes:
 
@@ -503,6 +504,17 @@ Platform notes:
   Next, Previous and Random walk until a row is played by hand. Removing
   rows edits `playlist.tracks` and nothing else: the app never deletes,
   moves or rewrites an audio file, and a test pins that.
+- A blind comparison, **Playback > Blind Comparison**, takes exactly two
+  selected rows, the first as A and the second as B, and lives in
+  `App::abx` and `abx.rs`. It is kept out of the playlists and the table
+  on purpose: the table highlights the playing row, and a highlight would
+  say which of the two X is. For the same reason `advance` leaves the
+  player alone while a test is open, and playing a row or opening the
+  preview ends the test. `App::abx_seed` mixes the clock into
+  `random_state` so a restart does not repeat the sides the run before it
+  drew. Nine right answers of ten pass, the smallest count under the
+  usual 5% level: guessing reaches nine or more 1.1% of the time, eight
+  5.5%.
 - The search box is `View::searching` and `View::filter`, drawn above the
   table by `ui::search_bar`. `Ctrl+F` or `/` opens it and `View::search_focus`
   asks for the keyboard once, so the box does not take it back every frame.

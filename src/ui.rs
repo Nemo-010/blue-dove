@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use eframe::egui::{self, Align2, Color32, FontId, Rect, Sense, Stroke, pos2, vec2};
 
+use crate::abx::{Abx, Choice, Side, TRIALS};
 use crate::app::{App, COMPACT_NAME_HEIGHT, COMPACT_WAVE_HEIGHT, ROW_HEIGHT, WAVE_HEIGHT};
 use crate::format;
 use crate::library::{Album, Track};
@@ -35,6 +36,24 @@ enum RowAction {
     Toggle(std::path::PathBuf),
     /// Play this loose track on its own.
     PlayLoose(usize),
+}
+
+/// What a click in the blind comparison asked for.
+///
+/// It is the same split as [`RowAction`]: the test is drawn from a shared
+/// borrow of the app, so the drawing records the request and the caller
+/// applies it once the drawing is done.
+enum AbxAction {
+    /// Play the track this choice names.
+    Play(Choice),
+    /// Answer that X is this side.
+    Answer(Side),
+    /// Move to the trial after the one answered.
+    Next,
+    /// Run the test again with the same two tracks.
+    Restart,
+    /// Close the test.
+    Close,
 }
 
 /// Side of the cover shown beside each album in the library list.
@@ -550,6 +569,21 @@ impl App {
 
                     self.setting_checkbox(ui, "Repeat Track", self.repeat, Self::set_repeat);
                     self.setting_checkbox(ui, "Random Order", self.random, Self::set_random);
+                    ui.separator();
+
+                    // Two rows are what a comparison needs: the first is A
+                    // and the second B.
+                    let pair = self.selected_tracks().len() == 2;
+                    if ui
+                        .add_enabled(pair, egui::Button::new("Blind Comparison"))
+                        .on_hover_text(
+                            "Compares the two selected tracks without saying which is which",
+                        )
+                        .clicked()
+                    {
+                        ui.close();
+                        self.start_abx();
+                    }
                 });
 
                 ui.menu_button("View", |ui| {
@@ -624,6 +658,33 @@ impl App {
                 });
             });
         });
+    }
+
+    /// Draws the blind comparison, when one is under way.
+    ///
+    /// It is a window over the playlist rather than a panel in it, so the
+    /// album list and the table stay where they are and the listener can
+    /// pick another pair as soon as the test ends.
+    pub(crate) fn abx_window(&mut self, ctx: &egui::Context) {
+        let Some(test) = &self.abx else {
+            return;
+        };
+        let mut action = None;
+        egui::Window::new("Blind Comparison")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                action = abx_body(ui, test);
+            });
+        match action {
+            Some(AbxAction::Play(choice)) => self.abx_play(choice),
+            Some(AbxAction::Answer(side)) => self.abx_answer(side),
+            Some(AbxAction::Next) => self.abx_next(),
+            Some(AbxAction::Restart) => self.abx_restart(),
+            Some(AbxAction::Close) => self.close_abx(),
+            None => {}
+        }
     }
 
     /// The playing album's cover, then, in the popup, the line naming the
@@ -1750,6 +1811,94 @@ impl App {
             self.seek_to(fraction);
         }
     }
+}
+
+/// Draws the body of the blind comparison and returns what a press asked for.
+///
+/// The two tracks are named, and the trial counts down, but which of the two
+/// X is never appears until the answer is given: that is what makes the test
+/// blind.
+fn abx_body(ui: &mut egui::Ui, test: &Abx) -> Option<AbxAction> {
+    let mut action = None;
+    for side in [Side::A, Side::B] {
+        let track = test.track(side);
+        ui.label(format!(
+            "{}: {} ({})",
+            side.label(),
+            track.title,
+            format::length(test.length(Choice::from(side)))
+        ));
+    }
+    ui.separator();
+
+    ui.horizontal(|ui| {
+        for choice in [Choice::A, Choice::B, Choice::X] {
+            // The highlight says which one the player was last sent to; the
+            // text stays the same so a button does not move under the
+            // pointer as the trial goes on.
+            let last = test.playing() == Some(choice);
+            if ui
+                .selectable_label(last, format!("Play {}", choice.label()))
+                .clicked()
+            {
+                action = Some(AbxAction::Play(choice));
+            }
+        }
+    });
+    ui.separator();
+
+    if test.done() {
+        ui.label(format!(
+            "{} of {} right, {} wrong",
+            test.correct(),
+            test.finished(),
+            test.wrong()
+        ));
+        let chance = test.p_value() * 100.0;
+        let verdict = if test.passed() {
+            "You could tell them apart."
+        } else {
+            "No evidence you could tell them apart."
+        };
+        ui.label(format!(
+            "{verdict} Guessing would have scored this well {chance:.1}% of the time."
+        ));
+    } else {
+        ui.label(format!("Trial {} of {}", test.trial(), TRIALS));
+        match test.answered() {
+            None => {
+                ui.label("Which one is X?");
+                ui.horizontal(|ui| {
+                    for side in [Side::A, Side::B] {
+                        if ui.button(format!("X is {}", side.label())).clicked() {
+                            action = Some(AbxAction::Answer(side));
+                        }
+                    }
+                });
+            }
+            Some(guess) => {
+                let answer = if test.answered_right() == Some(true) {
+                    format!("Right: X was {}.", guess.label())
+                } else {
+                    format!("Wrong: X was {}, not {}.", test.x().label(), guess.label())
+                };
+                ui.label(answer);
+                if ui.button("Next Trial").clicked() {
+                    action = Some(AbxAction::Next);
+                }
+            }
+        }
+    }
+
+    ui.horizontal(|ui| {
+        if test.done() && ui.button("Run Again").clicked() {
+            action = Some(AbxAction::Restart);
+        }
+        if ui.button("Close").clicked() {
+            action = Some(AbxAction::Close);
+        }
+    });
+    action
 }
 
 /// How many wheel notches the pointer moved this frame.
