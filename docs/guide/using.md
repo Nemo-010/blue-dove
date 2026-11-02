@@ -18,11 +18,16 @@ directory. Either way the directory you picked is scanned, even if its own
 name starts with a dot. Changing the setting scans again.
 
 The directory is remembered, so the next start scans it again and shows the
-library at once. It is scanned again every minute while the window runs, so a
-file added, moved or retagged outside the window shows up without one. That is
-what **File > Scan Automatically** covers, and it is on to begin with; turn it
-off and the library is only read when you ask, with **File > Rescan Library**
-or by changing the music directory.
+library at once. It is also watched while the window runs: a file added,
+moved or retagged outside the window is scanned a few seconds later,
+without a rescan by hand. That is what **File > Scan Automatically** covers,
+and it is on to begin with; turn it off and the library is only read when you
+ask, with **File > Rescan Library** or by changing the music directory.
+
+Storage that cannot report changes, such as a network share, is scanned an
+hour after the last scan instead, and so is a directory with more
+subdirectories than the kernel keeps watches for. Both still work, they just
+notice later.
 
 ## Find an album
 

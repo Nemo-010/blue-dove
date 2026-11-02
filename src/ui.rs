@@ -567,8 +567,8 @@ impl App {
                         Self::set_auto_scan,
                     )
                     .on_hover_text(
-                        "Scans the music directory at startup and every minute while \
-                         the window runs, so new files show up without a rescan",
+                        "Watches the music directory and rescans it when a file \
+                         changes, so new files show up without a rescan",
                     );
                     ui.separator();
                     self.setting_checkbox(

@@ -20,6 +20,7 @@ ape-decoder = "0.3.2"
 dirs = "7.0.0"
 eframe = { version = "0.37.0", default-features = false, features = ["clipboard", "default_fonts", "glow", "links", "wayland", "x11"] }
 lofty = "0.25.4"
+notify = "8"
 ogg = "0.9.2"
 opus-rs = "0.1.40"
 oxideav-musepack = "0.0.4"

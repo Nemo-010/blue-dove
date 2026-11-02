@@ -24,12 +24,29 @@ use crate::waveform;
 /// Frames a smoke run draws before it closes the window.
 const SMOKE_FRAMES: u32 = 3;
 
-/// How long the window waits between the scans it runs on its own.
+/// The fallback the automatic scan runs, in case nothing reports a change.
 ///
-/// A scan stats every file the cache holds and reads only what changed, so a
-/// minute of it costs little; it is the wait before a file added outside the
-/// window shows up, which is the whole point of scanning on a timer.
-pub const SCAN_EVERY: Duration = Duration::from_secs(60);
+/// The music directory is watched, so a file added while the window runs is
+/// scanned a few seconds later; this is what carries a library on
+/// storage that cannot report changes, or a tree too large for the kernel's
+/// watches. An hour is slow enough to cost nothing on a network share and
+/// fast enough that a new file still shows up in the same session.
+pub const SCAN_EVERY: Duration = Duration::from_secs(60 * 60);
+
+/// How long a change has to stop arriving before it is scanned.
+///
+/// Copying an album fires a change per file and per directory, and a scan of
+/// each would read the library over and over: a scan waits for the burst to
+/// end, and every further change pushes that wait back. Long enough that a
+/// copy over the network, whose last write and last event can arrive a few
+/// seconds apart, is one scan rather than two.
+pub const SETTLE: Duration = Duration::from_secs(5);
+
+/// How long a watch that could not be started waits before it is tried again.
+///
+/// Storage that cannot report changes refuses every time, so a retry per frame
+/// would be a failure per frame; the fallback scan covers the gap meanwhile.
+const WATCH_RETRY: Duration = Duration::from_secs(60);
 
 /// Height of one track row, in points.
 pub const ROW_HEIGHT: f32 = 22.0;
@@ -281,12 +298,24 @@ pub struct App {
     /// Whether the music directory is scanned at startup and while the window
     /// runs, so a file added outside the window shows up on its own.
     pub(crate) auto_scan: bool,
-    /// When a scan last ended, for the one that runs while the window runs.
+    /// When a scan last ended, for the fallback the timer runs.
     ///
     /// `None` is a run that has not scanned yet, which reads as due: a window
     /// whose library is empty has nothing to lose by looking at the directory
     /// again.
     pub(crate) scanned_at: Option<Instant>,
+    /// When the change the watcher reported may be scanned.
+    ///
+    /// A change arrives per file, so the scan waits for the burst to end; a
+    /// further change pushes the wait back rather than adding a scan.
+    pub(crate) scan_after: Option<Instant>,
+    /// The watch on the music directory, when it can be watched.
+    pub(crate) watch: Option<crate::watch::Watch>,
+    /// The directory a watch could not be started on, and when it was tried.
+    ///
+    /// Retrying a tree the kernel has no watcher left for would fail on every
+    /// frame, so a directory that refused waits a minute before the next go.
+    pub(crate) watch_failed: Option<(PathBuf, Instant)>,
     /// Whether the scan in flight was started by the timer rather than by the
     /// user.
     ///
@@ -435,6 +464,9 @@ impl App {
             ignore_hidden,
             auto_scan,
             scanned_at: None,
+            scan_after: None,
+            watch: None,
+            watch_failed: None,
             scan_quiet: false,
             cover_fit,
             preview_enabled,
@@ -822,17 +854,23 @@ impl App {
         self.scan = Some((crate::library::spawn_scan(directory, self.ignore_hidden), 0));
     }
 
-    /// Starts the scan the timer is due to run, when one is.
+    /// Starts the scan that is due, when one is.
     ///
-    /// Nothing is scanned with no directory to scan, with a scan already
-    /// running, or with the automatic scan turned off; the timer itself costs
-    /// nothing, so it is not stopped and restarted with those changes.
+    /// A change the watcher reported is scanned once the burst that caused it
+    /// has ended; the timer is what catches a library on storage that reports
+    /// nothing at all. Nothing is scanned with a scan already running, with
+    /// no directory to scan, or with the automatic scan turned off.
     fn scan_when_due(&mut self) {
         if !self.auto_scan || self.scan.is_some() {
             return;
         }
-        if matches!(self.scanned_at, Some(at) if at.elapsed() < SCAN_EVERY) {
-            return;
+        match self.scan_after {
+            // The burst is still arriving, and every event pushes this back.
+            Some(after) if Instant::now() < after => return,
+            Some(_) => self.scan_after = None,
+            // Nothing was reported: only the fallback is left to be due.
+            None if matches!(self.scanned_at, Some(at) if at.elapsed() < SCAN_EVERY) => return,
+            None => {}
         }
         let Some(directory) = self.config.music_directory.clone() else {
             return;
@@ -840,7 +878,7 @@ impl App {
         self.start_quiet_scan(directory);
     }
 
-    /// How long until the scan the timer runs is due.
+    /// How long until a scan is due.
     ///
     /// `None` when no scan is due at all: the automatic scan is off, there is
     /// no directory to scan, or a scan is already running, which says so in
@@ -849,10 +887,49 @@ impl App {
         if !self.auto_scan || self.scan.is_some() || self.config.music_directory.is_none() {
             return None;
         }
-        Some(match self.scanned_at {
-            Some(at) => SCAN_EVERY.saturating_sub(at.elapsed()),
-            None => Duration::ZERO,
+        Some(match (self.scan_after, self.scanned_at) {
+            (Some(after), _) => after.saturating_duration_since(Instant::now()),
+            (None, Some(at)) => SCAN_EVERY.saturating_sub(at.elapsed()),
+            (None, None) => Duration::ZERO,
         })
+    }
+
+    /// Watches the music directory, or stops watching the one it watched.
+    ///
+    /// Called once a frame and cheap when there is nothing to do: it starts a
+    /// watch when one is wanted and none is running on the directory the
+    /// library is read from, and drops it when the automatic scan is turned
+    /// off or the directory changes.
+    fn watch_directory(&mut self, ctx: &egui::Context) {
+        let wanted = self
+            .auto_scan
+            .then(|| self.config.music_directory.clone())
+            .flatten();
+        let Some(directory) = wanted else {
+            self.watch = None;
+            return;
+        };
+        if self
+            .watch
+            .as_ref()
+            .is_some_and(|watch| watch.root() == directory)
+        {
+            return;
+        }
+        if matches!(&self.watch_failed, Some((root, at)) if *root == directory && at.elapsed() < WATCH_RETRY)
+        {
+            return;
+        }
+        self.watch = None;
+        let ctx = ctx.clone();
+        let wake: crate::watch::Waker = std::sync::Arc::new(move || ctx.request_repaint());
+        match crate::watch::spawn(&directory, wake) {
+            Some(watch) => {
+                self.watch = Some(watch);
+                self.watch_failed = None;
+            }
+            None => self.watch_failed = Some((directory, Instant::now())),
+        }
     }
 
     /// Opens a directory, remembers it and scans it.
@@ -864,8 +941,18 @@ impl App {
 
     /// Takes in what the background threads have finished.
     fn poll_workers(&mut self, ctx: &egui::Context) {
-        // The scan the timer is due to run starts here, so a file added
-        // outside the window is picked up while the window runs.
+        // A change under the music directory is scanned once the burst that
+        // caused it has ended, so a copy of an album is one scan rather than
+        // one per file.
+        self.watch_directory(ctx);
+        if self
+            .watch
+            .as_ref()
+            .is_some_and(crate::watch::Watch::changed)
+        {
+            self.scan_after = Some(Instant::now() + SETTLE);
+            ctx.request_repaint_after(SETTLE);
+        }
         self.scan_when_due();
         let mut finished = false;
         let mut scanned: Option<Box<Library>> = None;
@@ -4071,7 +4158,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn the_timer_scans_once_a_minute_has_passed() {
+    fn the_fallback_scan_runs_once_an_hour_has_passed() {
         let mut app = app_with(&[("One", &["A"])]);
         app.config.music_directory = Some(std::env::temp_dir());
         app.auto_scan = true;
@@ -4086,7 +4173,110 @@ pub(crate) mod tests {
         app.scan = None;
         app.scanned_at = Some(Instant::now());
         app.poll_workers(&ctx);
-        assert!(app.scan.is_none(), "a minute has not passed yet");
+        assert!(
+            app.scan.is_none(),
+            "the fallback is an hour off, and the watch is what notices changes"
+        );
+    }
+
+    #[test]
+    fn a_change_is_scanned_once_it_stops_arriving() {
+        // Copying an album fires a change per file. A scan of each would read
+        // the library over and over, so the scan waits for the burst to end,
+        // and a further change pushes that wait back.
+        let mut app = app_with(&[("One", &["A"])]);
+        // A directory of its own, since anything written to the shared one
+        // while the test runs is a change that pushes the wait back.
+        let directory =
+            std::env::temp_dir().join(format!("blue-dove-settle-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).expect("the directory is made");
+        app.config.music_directory = Some(directory.clone());
+        app.auto_scan = true;
+        app.scanned_at = Some(Instant::now());
+        let ctx = egui::Context::default();
+
+        app.scan_after = Some(Instant::now() + SETTLE);
+        app.poll_workers(&ctx);
+        assert!(app.scan.is_none(), "the burst has not ended yet");
+
+        app.scan_after = Some(Instant::now());
+        app.poll_workers(&ctx);
+        assert!(app.scan.is_some(), "the change is scanned once it has");
+        assert!(
+            app.scan_quiet,
+            "and quietly, since it may well find nothing new"
+        );
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn a_change_under_the_music_directory_is_taken_in() {
+        // This is the whole point of watching instead of polling: a file that
+        // arrives while the window runs sets the wait that ends in a scan,
+        // rather than waiting for the hour the fallback runs on.
+        let directory =
+            std::env::temp_dir().join(format!("blue-dove-watched-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).expect("the directory is made");
+        let mut app = app_with(&[("One", &["A"])]);
+        app.config.music_directory = Some(directory.clone());
+        app.auto_scan = true;
+        app.scanned_at = Some(Instant::now());
+        let ctx = egui::Context::default();
+        app.poll_workers(&ctx);
+        if app.watch.is_none() {
+            // A host that cannot watch a directory has only the fallback.
+            let _ = std::fs::remove_dir_all(&directory);
+            return;
+        }
+        assert!(app.scan_after.is_none(), "nothing has changed yet");
+
+        std::fs::write(directory.join("song.wav"), b"not really audio")
+            .expect("the file is written");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while app.scan_after.is_none() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+            app.poll_workers(&ctx);
+        }
+
+        assert!(
+            app.scan_after.is_some(),
+            "the change is noted, so a scan follows once it settles"
+        );
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn a_watch_is_started_on_the_music_directory() {
+        let mut app = app_with(&[("One", &["A"])]);
+        let directory =
+            std::env::temp_dir().join(format!("blue-dove-autoscan-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).expect("the directory is made");
+        app.config.music_directory = Some(directory.clone());
+        app.auto_scan = true;
+
+        app.poll_workers(&egui::Context::default());
+
+        assert!(
+            app.watch
+                .as_ref()
+                .is_some_and(|watch| watch.root() == directory),
+            "the directory the library is read from is the one watched"
+        );
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn turning_the_automatic_scan_off_stops_the_watch() {
+        let mut app = app_with(&[("One", &["A"])]);
+        app.config.music_directory = Some(std::env::temp_dir());
+        app.auto_scan = true;
+        app.poll_workers(&egui::Context::default());
+
+        app.set_auto_scan(false);
+        app.poll_workers(&egui::Context::default());
+
+        assert!(app.watch.is_none(), "nothing is watched with it off");
     }
 
     #[test]
