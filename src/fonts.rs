@@ -92,13 +92,14 @@ const ARABIC: &[&str] = &[
 /// until a face that can place the mark is loaded. `notosansregular` is the
 /// plain face rather than the CJK one, which is preferred here for its
 /// accents; the CJK face is found for the script it is wanted for anyway.
-const LATIN: &[&str] = &[
-    "notosansregular",
-    "notosans",
-    "dejavusans",
-    "freesans",
-    "freeserif",
-];
+///
+/// The plain family is named with its weight, `notosansregular`, and never as
+/// `notosans` alone: every Noto face is spelled `NotoSans` and then the script
+/// it is for, so a bare family pattern answers with the symbols face, or the
+/// Arabic one, on a system that has no plain Noto Sans -- and having answered,
+/// it stops the search before the catch-all faces, which are the ones that do
+/// carry the accents.
+const LATIN: &[&str] = &["notosansregular", "dejavusans", "freesans", "freeserif"];
 
 /// File name fragments of fonts that carry the symbols a title collects.
 ///
@@ -360,17 +361,48 @@ fn is_font(path: &Path) -> bool {
         })
 }
 
+/// Style words that name a face other than the plain one.
+///
+/// A family ships every weight under the same name, so a walk over a directory
+/// reaches whichever of them it is spelled with first: `DroidNaskh-Bold.ttf`
+/// before `DroidNaskh-Regular.ttf` would draw every Arabic title bold. The
+/// plain face is the one whose name holds none of these words.
+const STYLES: &[&str] = &[
+    "bold",
+    "italic",
+    "oblique",
+    "light",
+    "black",
+    "thin",
+    "medium",
+    "heavy",
+    "condensed",
+    "extended",
+];
+
 /// The best of `files`, by the order `patterns` gives.
 ///
 /// A pattern is searched for in the whole path, so a font in a directory named
 /// after its family is found too, and the first pattern that matches wins.
+/// Among the faces one pattern matches, the regular weight is preferred to any
+/// other, since every weight of a family answers to the same name.
 fn pick(files: &[PathBuf], patterns: &[&str]) -> Option<PathBuf> {
     patterns.iter().find_map(|pattern| {
-        files.iter().find_map(|path| {
-            let name = squashed(&path.to_string_lossy());
-            name.contains(pattern).then(|| path.clone())
-        })
+        files
+            .iter()
+            .filter(|path| {
+                let name = squashed(&path.to_string_lossy());
+                name.contains(pattern)
+            })
+            .min_by_key(|path| styled(&squashed(&path.to_string_lossy())))
+            .cloned()
     })
+}
+
+/// Whether `name` is a weight or a slant of its family rather than the plain
+/// face.
+fn styled(name: &str) -> bool {
+    STYLES.iter().any(|style| name.contains(style))
 }
 
 /// The letters and digits of `text`, in lower case.
@@ -525,6 +557,42 @@ mod tests {
             pick(&bare, LATIN),
             None,
             "a face that draws no more than the bundled one is no fallback"
+        );
+    }
+
+    #[test]
+    fn a_bare_family_name_does_not_answer_with_another_scripts_face() {
+        // Every Noto face is spelled `NotoSans` and then the script it is for,
+        // so a bare family pattern matches the symbols face as readily as the
+        // plain one. Answering with it would stop the search before the
+        // catch-all faces, and this list exists for the accents those carry.
+        let files = paths(&[
+            "/usr/share/fonts/noto/NotoSansSymbols2-Regular.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        ]);
+        assert_eq!(
+            pick(&files, LATIN),
+            Some(PathBuf::from(
+                "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
+            )),
+            "the face with the accents, not the one that only has symbols"
+        );
+    }
+
+    #[test]
+    fn the_regular_weight_of_a_family_is_preferred_to_a_heavier_one() {
+        // A family ships every weight under one name, and the walk reaches
+        // whichever the directory spells first.
+        let files = paths(&[
+            "/usr/share/fonts/truetype/droid/DroidNaskh-Bold.ttf",
+            "/usr/share/fonts/truetype/droid/DroidNaskh-Regular.ttf",
+        ]);
+        assert_eq!(
+            pick(&files, ARABIC),
+            Some(PathBuf::from(
+                "/usr/share/fonts/truetype/droid/DroidNaskh-Regular.ttf"
+            )),
+            "the plain weight, not the bold one the walk met first"
         );
     }
 

@@ -29,7 +29,7 @@ use crate::library::{Library, Track};
 
 /// Version of the cache layout, so an older file is ignored rather than
 /// misread after a change to what is stored.
-const VERSION: u32 = 4;
+const VERSION: u32 = 5;
 
 /// Magic at the head of a stored waveform.
 const WAVEFORM_MAGIC: &[u8; 4] = b"BDWV";
