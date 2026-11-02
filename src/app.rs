@@ -880,6 +880,18 @@ impl App {
         self.scan = Some((crate::library::spawn_scan(directory, self.ignore_hidden), 0));
     }
 
+    /// The files the scan has read so far, for the menu bar to count.
+    ///
+    /// A scan the watcher or the timer started is background work: its
+    /// counter would come and go on its own, saying nothing the listener
+    /// asked for. Only a scan they started draws one.
+    pub(crate) fn scan_progress(&self) -> Option<usize> {
+        match &self.scan {
+            Some((_, seen)) if !self.scan_quiet => Some(*seen),
+            _ => None,
+        }
+    }
+
     /// Starts the scan that is due, when one is.
     ///
     /// A change the watcher reported is scanned once the burst that caused it
@@ -4671,6 +4683,25 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_scan_the_window_did_not_ask_for_shows_no_counter() {
+        // The menu bar counts the files a scan has read. A scan the watcher
+        // started is not one the listener asked for, and a counter coming and
+        // going on its own is noise in the menu bar.
+        let mut app = app_with(&[("One", &["A"])]);
+        let (_sender, receiver) = std::sync::mpsc::channel();
+        app.scan = Some((receiver, 7));
+        app.scan_quiet = true;
+
+        assert_eq!(app.scan_progress(), None, "a background scan draws nothing");
+
+        app.scan_quiet = false;
+        assert_eq!(app.scan_progress(), Some(7), "a rescan counts its files");
+
+        app.scan = None;
+        assert_eq!(app.scan_progress(), None, "and nothing is drawn with none");
+    }
+
+    #[test]
     fn the_scan_the_timer_runs_takes_in_what_changed() {
         let mut app = app_with(&[("One", &["A"])]);
         let mut tracks = app.library.tracks.clone();
@@ -4803,6 +4834,9 @@ pub(crate) mod tests {
         let mut app = app_with(&[("One", &["A"])]);
         app.config.music_directory = Some(directory.clone());
         app.auto_scan = true;
+        // The timer is not what this is about: what it would start would run
+        // beside the watch and say nothing about it.
+        app.scanned_at = Some(Instant::now());
         let ctx = egui::Context::default();
         app.poll_workers(&ctx);
         if app.watch.is_none() {
@@ -4829,6 +4863,20 @@ pub(crate) mod tests {
         assert!(
             app.watch.as_ref().is_some_and(|watch| !watch.ended()),
             "a live watch is placed on the directory that came back"
+        );
+
+        // And it is alive, not merely present: what is written under it is
+        // reported.
+        std::fs::write(directory.join("song.wav"), b"not really audio")
+            .expect("the file is written");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while app.scan_after.is_none() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+            app.poll_workers(&ctx);
+        }
+        assert!(
+            app.scan_after.is_some(),
+            "a file written after the directory came back is reported"
         );
         let _ = std::fs::remove_dir_all(&directory);
     }
