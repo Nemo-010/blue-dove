@@ -84,6 +84,12 @@ pub const COMPACT_BREAK: [f32; 2] = [560.0, 430.0];
 /// naming the track, the controls and the waveform.
 pub const PREVIEW_NO_ART_SIZE: [f32; 2] = [320.0, 92.0];
 
+/// The MPRIS track id a preview answers with.
+///
+/// A previewed file is in no playlist, so it has no index to be named by; a
+/// value past any index keeps it apart from a track of the library that does.
+const PREVIEW_TRACK: u64 = u64::MAX;
+
 /// The size the compact layout snaps the window to when the track has no art,
 /// in points.
 ///
@@ -2488,8 +2494,22 @@ impl App {
         self.requests = Some(crate::instance::serve(listener, waker));
     }
 
+    /// Whether a command from a D-Bus client applies to what plays now.
+    ///
+    /// The preview plays one file with no playlist behind it, so Play and
+    /// Pause are the only transport it has: a step would leave the file for a
+    /// track of the playlist the preview never touched, and a stop has
+    /// nowhere to put the window back to.
+    fn remote_command_applies(&self, command: Command) -> bool {
+        self.preview.is_none()
+            || !matches!(command, Command::Next | Command::Previous | Command::Stop)
+    }
+
     /// Carries out one command from a D-Bus client.
     fn apply(&mut self, command: Command) {
+        if !self.remote_command_applies(command) {
+            return;
+        }
         match command {
             Command::Play if self.playing.is_none() || self.paused() => self.toggle(),
             Command::Play => {}
@@ -2519,17 +2539,25 @@ impl App {
         }
     }
 
-    /// The art file MPRIS names for the playing track, when it has a cover.
+    /// The art file MPRIS names for the loaded track, when it has a cover.
     ///
     /// The picture is written once per track and kept: a frame that encoded
     /// it again would spend more time on the PNG than on the window. What is
     /// kept is dropped as soon as nothing plays, so a stop leaves the
     /// metadata without art rather than with the art of the last track.
     fn art_path(&mut self) -> Option<PathBuf> {
-        if self.playing.is_none() {
+        let Some(cover_key) = self.described_track().map(|track| track.cover.clone()) else {
+            // Nothing is loaded, so the art of the last track is forgotten
+            // rather than left beside an empty title.
             self.art = None;
             return None;
-        }
+        };
+        let Some(key) = cover_key else {
+            // The loaded track carries no cover, which is remembered so a
+            // later frame does not look for one again.
+            self.art = Some(None);
+            return None;
+        };
         match &self.art {
             // Nothing to write for this track, or a write that failed once
             // and would fail the same way on the next frame.
@@ -2537,24 +2565,32 @@ impl App {
             Some(Some(path)) if path.is_file() => return Some(path.clone()),
             _ => {}
         }
-        let key = self
-            .playing
-            .and_then(|index| self.library.tracks.get(index))
-            .and_then(|track| track.cover.clone());
         // The picture is usually on screen already, so it is taken from there;
         // a track that plays without being drawn is decoded here instead.
-        let cover = key
-            .as_deref()
-            .and_then(|key| match self.pictures.decoded(key) {
-                Some(cover) => cover,
-                None => crate::art::decode_now(key).map(std::sync::Arc::new),
-            });
-        let path = match (key.as_deref(), cover.as_deref()) {
-            (Some(key), Some(cover)) => crate::cache::art_file(key, cover),
-            _ => None,
+        let cover = match self.pictures.decoded(&key) {
+            Some(cover) => cover,
+            None => crate::art::decode_now(&key).map(std::sync::Arc::new),
         };
+        let path = cover
+            .as_deref()
+            .and_then(|cover| crate::cache::art_file(&key, cover));
         self.art = Some(path.clone());
         path
+    }
+
+    /// The track MPRIS describes: the preview's when one is showing, else the
+    /// track that plays.
+    ///
+    /// A previewed file is read on its own and is in no playlist, so it has no
+    /// index into the library. Asking the library for the playing track alone
+    /// would leave a client with no title, no album and no art for the one file
+    /// the window is looking at.
+    fn described_track(&self) -> Option<&Track> {
+        if let Some(preview) = &self.preview {
+            return Some(preview);
+        }
+        self.playing
+            .and_then(|index| self.library.tracks.get(index))
     }
 
     /// Tells the service what the player is doing.
@@ -2562,12 +2598,18 @@ impl App {
         if self.mpris.is_none() {
             return;
         }
+        let state = self.mpris_state();
+        if let Some(service) = &self.mpris {
+            service.update(state);
+        }
+    }
+
+    /// What the player tells a client about itself.
+    fn mpris_state(&mut self) -> crate::mpris::State {
         // The art is written before the tracks are borrowed, since writing it
         // needs the app mutably.
         let art = self.art_path();
-        let track = self
-            .playing
-            .and_then(|index| self.library.tracks.get(index));
+        let track = self.described_track();
         let title = track.map(|track| track.title.clone()).unwrap_or_default();
         let artists: Vec<String> = track
             .map(|track| {
@@ -2581,13 +2623,17 @@ impl App {
             })
             .unwrap_or_default();
         let album = track.map(|track| track.album.clone()).unwrap_or_default();
-        let playback = match self.playing {
-            None => Playback::Stopped,
-            Some(_) if self.paused() => Playback::Paused,
-            Some(_) => Playback::Playing,
+        let loaded = track.is_some();
+        // The preview is one file, and the playlist it was opened over is not
+        // what it walks: a client offered Next there would step out of the
+        // file and into a track the listener never asked for.
+        let stepable = self.preview.is_none() && self.walked_tracks().len() > 1;
+        let playback = match loaded {
+            false => Playback::Stopped,
+            true if self.paused() => Playback::Paused,
+            true => Playback::Playing,
         };
-        let queue = self.walked_tracks().len();
-        let state = crate::mpris::State {
+        crate::mpris::State {
             playback,
             title,
             artists,
@@ -2597,14 +2643,15 @@ impl App {
             volume: f64::from(self.volume),
             repeat: self.repeat,
             shuffle: self.random,
-            can_seek: self.playing.is_some() && !self.length.is_zero(),
-            can_go_next: queue > 1,
-            can_go_previous: queue > 1,
-            track: self.playing.map_or(0, |index| index as u64),
+            can_seek: loaded && !self.length.is_zero(),
+            can_go_next: stepable,
+            can_go_previous: stepable,
+            track: match (self.preview.is_some(), self.playing) {
+                (true, _) => PREVIEW_TRACK,
+                (false, Some(index)) => index as u64,
+                (false, None) => 0,
+            },
             art,
-        };
-        if let Some(service) = &self.mpris {
-            service.update(state);
         }
     }
 
@@ -3299,6 +3346,105 @@ pub(crate) mod tests {
             queued,
             "the playlist is untouched"
         );
+    }
+
+    #[test]
+    fn mpris_describes_the_previewed_file() {
+        // The preview reads its file on its own and is in no playlist, so what
+        // a client shows has to come from that file: a title, an album and an
+        // artist taken from the library would describe a track that is not
+        // playing, and the player would read as stopped while it plays.
+        let mut app = app_with(&[("One", &["A", "B"])]);
+        let path = app.library.tracks[0].path.clone();
+        app.open_preview(&egui::Context::default(), &path);
+        assert!(app.playing.is_none(), "the preview leaves the list alone");
+
+        let state = app.mpris_state();
+        assert_eq!(state.title, "A");
+        assert_eq!(state.album, "One");
+        assert_eq!(
+            state.artists,
+            ["Unknown Artist"],
+            "the artist is the file's own, not the library row's"
+        );
+        assert_ne!(
+            state.playback,
+            Playback::Stopped,
+            "a file the window is showing is not stopped"
+        );
+        assert_eq!(state.track, PREVIEW_TRACK, "the preview is no playlist row");
+    }
+
+    #[test]
+    fn mpris_names_the_previews_art() {
+        // A media widget draws the art from the URI in the metadata, so the
+        // picture of a previewed file has to be written out like any other.
+        let mut app = app_with(&[("One", &["A"])]);
+        let path = app.library.tracks[0].path.clone();
+        app.open_preview(&egui::Context::default(), &path);
+
+        let cover = crate::cover::Cover {
+            width: 2,
+            height: 2,
+            rgba: vec![1, 2, 3, 255, 4, 5, 6, 255, 7, 8, 9, 255, 10, 11, 12, 255],
+        };
+        let bytes = crate::cover::to_png(&cover).expect("the picture encodes");
+        let key = crate::cache::store_cover(&bytes).expect("the picture is stored");
+        app.preview.as_mut().expect("the preview is showing").cover = Some(key);
+
+        let state = app.mpris_state();
+        assert!(state.art.is_some(), "the previewed file's art is named");
+    }
+
+    #[test]
+    fn the_preview_offers_no_next_or_previous() {
+        // The file a preview plays is in no playlist, so a client that was
+        // offered Next would step into whatever the playlist happens to hold
+        // and leave the file behind.
+        let mut app = app_with(&[("One", &["A", "B", "C"])]);
+        let path = app.library.tracks[0].path.clone();
+        app.open_preview(&egui::Context::default(), &path);
+
+        let state = app.mpris_state();
+        assert!(!state.can_go_next, "there is no track after the file");
+        assert!(!state.can_go_previous, "and none before it");
+
+        // A playlist with rows either side of the playing one offers both.
+        let mut playing = app_with(&[("One", &["A", "B", "C"])]);
+        playing.playing = Some(0);
+        let state = playing.mpris_state();
+        assert!(state.can_go_next && state.can_go_previous);
+    }
+
+    #[test]
+    fn the_preview_answers_play_and_pause_only() {
+        let mut app = app_with(&[("One", &["A", "B"])]);
+        let path = app.library.tracks[0].path.clone();
+        app.open_preview(&egui::Context::default(), &path);
+
+        assert!(app.remote_command_applies(Command::Play));
+        assert!(app.remote_command_applies(Command::Pause));
+        assert!(app.remote_command_applies(Command::PlayPause));
+        assert!(app.remote_command_applies(Command::Seek(1_000_000)));
+        assert!(!app.remote_command_applies(Command::Next));
+        assert!(!app.remote_command_applies(Command::Previous));
+        assert!(!app.remote_command_applies(Command::Stop));
+    }
+
+    #[test]
+    fn a_playlist_play_answers_a_step_and_a_stop() {
+        let app = app_with(&[("One", &["A", "B"])]);
+        for command in [
+            Command::Next,
+            Command::Previous,
+            Command::Stop,
+            Command::Play,
+        ] {
+            assert!(
+                app.remote_command_applies(command),
+                "{command:?} applies to the playlist"
+            );
+        }
     }
 
     #[test]
