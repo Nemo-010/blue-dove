@@ -25,6 +25,7 @@ mod player;
 mod playlist;
 mod theme;
 mod ui;
+mod watch;
 mod waveform;
 
 use app::App;

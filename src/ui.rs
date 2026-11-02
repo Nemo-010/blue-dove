@@ -560,6 +560,16 @@ impl App {
                             self.start_scan(directory);
                         }
                     }
+                    self.setting_checkbox(
+                        ui,
+                        "Scan Automatically",
+                        self.auto_scan,
+                        Self::set_auto_scan,
+                    )
+                    .on_hover_text(
+                        "Watches the music directory and rescans it when a file \
+                         changes, so new files show up without a rescan",
+                    );
                     ui.separator();
                     self.setting_checkbox(
                         ui,
@@ -732,8 +742,6 @@ impl App {
     /// It sits above the album list rather than beside the waveform, so the
     /// waveform can use the whole width of the window.
     fn now_playing(&mut self, ui: &mut egui::Ui, compact: bool) {
-        let texture = self.playing_cover(ui.ctx());
-
         // A track with no art gets no square at all: an empty box the size of
         // a cover is the largest thing in the window and says nothing. What
         // the player draws then is the name, the controls and the waveform.
@@ -762,6 +770,10 @@ impl App {
         } else {
             art_room
         };
+        // The cover is decoded at the size this square is drawn, so the size
+        // has to be known before the texture is asked for: a thumbnail
+        // stretched over a square this wide reads blurry.
+        let texture = self.playing_art(ui.ctx(), side);
         // A popup can be wider than it is tall, and the art is square, so it
         // is centred in the room it does not fill.
         let inset = if compact {

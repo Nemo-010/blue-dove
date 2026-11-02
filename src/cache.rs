@@ -29,7 +29,7 @@ use crate::library::{Library, Track};
 
 /// Version of the cache layout, so an older file is ignored rather than
 /// misread after a change to what is stored.
-const VERSION: u32 = 4;
+const VERSION: u32 = 5;
 
 /// Magic at the head of a stored waveform.
 const WAVEFORM_MAGIC: &[u8; 4] = b"BDWV";
@@ -207,6 +207,15 @@ fn cache_root(root: &Path) -> PathBuf {
 fn file_name(root: &Path) -> String {
     let hash = digest(cache_root(root).as_os_str().as_encoded_bytes());
     format!("library-{hash:016x}.toml")
+}
+
+/// Where the cache for `root` is kept.
+///
+/// Only the tests ask: a scan writes the file itself, and what they check is
+/// whether a scan of an untouched library wrote it again.
+#[cfg(test)]
+pub(crate) fn cache_path(root: &Path) -> Option<PathBuf> {
+    Some(cache_dir()?.join(file_name(root)))
 }
 
 /// The directory the cache is kept in, when the platform has a cache directory.

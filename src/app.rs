@@ -8,7 +8,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::Receiver;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use eframe::egui;
 
@@ -23,6 +23,30 @@ use crate::waveform;
 
 /// Frames a smoke run draws before it closes the window.
 const SMOKE_FRAMES: u32 = 3;
+
+/// The fallback the automatic scan runs, in case nothing reports a change.
+///
+/// The music directory is watched, so a file added while the window runs is
+/// scanned a few seconds later; this is what carries a library on
+/// storage that cannot report changes, or a tree too large for the kernel's
+/// watches. An hour is slow enough to cost nothing on a network share and
+/// fast enough that a new file still shows up in the same session.
+pub const SCAN_EVERY: Duration = Duration::from_secs(60 * 60);
+
+/// How long a change has to stop arriving before it is scanned.
+///
+/// Copying an album fires a change per file and per directory, and a scan of
+/// each would read the library over and over: a scan waits for the burst to
+/// end, and every further change pushes that wait back. Long enough that a
+/// copy over the network, whose last write and last event can arrive a few
+/// seconds apart, is one scan rather than two.
+pub const SETTLE: Duration = Duration::from_secs(5);
+
+/// How long a watch that could not be started waits before it is tried again.
+///
+/// Storage that cannot report changes refuses every time, so a retry per frame
+/// would be a failure per frame; the fallback scan covers the gap meanwhile.
+const WATCH_RETRY: Duration = Duration::from_secs(60);
 
 /// Height of one track row, in points.
 pub const ROW_HEIGHT: f32 = 22.0;
@@ -59,6 +83,12 @@ pub const COMPACT_BREAK: [f32; 2] = [560.0, 430.0];
 /// No square is drawn without art, so the window is only as tall as the line
 /// naming the track, the controls and the waveform.
 pub const PREVIEW_NO_ART_SIZE: [f32; 2] = [320.0, 92.0];
+
+/// The MPRIS track id a preview answers with.
+///
+/// A previewed file is in no playlist, so it has no index to be named by; a
+/// value past any index keeps it apart from a track of the library that does.
+const PREVIEW_TRACK: u64 = u64::MAX;
 
 /// The size the compact layout snaps the window to when the track has no art,
 /// in points.
@@ -160,6 +190,16 @@ pub struct View {
     pub rename_buffer: String,
 }
 
+/// A cover uploaded at the size the big square draws it.
+pub(crate) struct BigArt {
+    /// The key of the picture, so another track's art is not mistaken for it.
+    key: String,
+    /// The size it was decoded at, in pixels.
+    side: u32,
+    /// The texture the window draws.
+    texture: egui::TextureHandle,
+}
+
 /// Everything the window draws, and the state behind it.
 pub struct App {
     /// Whether the window closes itself after [`SMOKE_FRAMES`] frames.
@@ -190,6 +230,14 @@ pub struct App {
     pub(crate) wave_columns: Option<(usize, u32, usize, Vec<f32>)>,
     /// Textures for covers, keyed by the key their picture is stored under.
     pub(crate) textures: HashMap<String, egui::TextureHandle>,
+    /// The cover of the loaded track at the size the big square draws it.
+    ///
+    /// One at a time: the square shows one track, and a texture per track
+    /// ever played would keep megabytes of pixels nothing draws.
+    pub(crate) big_art: Option<BigArt>,
+    /// The size the square is waiting for, so a size it grew past is dropped
+    /// rather than decoded and kept.
+    pub(crate) big_asked: Option<String>,
     /// Pictures decoded off the drawing thread.
     ///
     /// A start decodes none of them: the window asks for the ones it is about
@@ -271,6 +319,35 @@ pub struct App {
     pub(crate) background: bool,
     /// Whether the scan leaves out files and directories starting with a dot.
     pub(crate) ignore_hidden: bool,
+    /// Whether the music directory is scanned at startup and while the window
+    /// runs, so a file added outside the window shows up on its own.
+    pub(crate) auto_scan: bool,
+    /// When a scan last ended, for the fallback the timer runs.
+    ///
+    /// `None` is a run that has not scanned yet, which reads as due: a window
+    /// whose library is empty has nothing to lose by looking at the directory
+    /// again.
+    pub(crate) scanned_at: Option<Instant>,
+    /// When the change the watcher reported may be scanned.
+    ///
+    /// A change arrives per file, so the scan waits for the burst to end; a
+    /// further change pushes the wait back rather than adding a scan.
+    pub(crate) scan_after: Option<Instant>,
+    /// The watch on the music directory, when it can be watched.
+    pub(crate) watch: Option<crate::watch::Watch>,
+    /// The directory a watch could not be started on, and when it was tried.
+    ///
+    /// Retrying a tree the kernel has no watcher left for would fail on every
+    /// frame, so a directory that refused waits a minute before the next go.
+    pub(crate) watch_failed: Option<(PathBuf, Instant)>,
+    /// Whether the scan in flight was started by the timer rather than by the
+    /// user.
+    ///
+    /// A scan the timer started takes in only what changed: a library the
+    /// window already lists would be rebuilt track by track, have its album
+    /// list put back to the first album, and write the session file, every
+    /// minute and for nothing.
+    pub(crate) scan_quiet: bool,
     /// Whether the album art is fitted whole into its square, rather than
     /// cropped to fill it.
     pub(crate) cover_fit: bool,
@@ -355,6 +432,7 @@ impl App {
         let background = config.background.unwrap_or(false);
         let ignore_hidden = config.ignore_hidden.unwrap_or(true);
         let cover_fit = config.cover_fit.unwrap_or(false);
+        let auto_scan = config.auto_scan.unwrap_or(true);
         let preview_enabled = config.preview.unwrap_or(true);
         // The bus is reached on a thread of its own, so a host without one,
         // or with one that is slow to answer, never holds up the window.
@@ -380,6 +458,8 @@ impl App {
             peaks: Vec::new(),
             wave_columns: None,
             textures: HashMap::new(),
+            big_art: None,
+            big_asked: None,
             pictures: crate::art::Art::default(),
             audio: None,
             playing: None,
@@ -408,6 +488,12 @@ impl App {
             pending_paths: (!paths.is_empty()).then_some(paths),
             background,
             ignore_hidden,
+            auto_scan,
+            scanned_at: None,
+            scan_after: None,
+            watch: None,
+            watch_failed: None,
+            scan_quiet: false,
             cover_fit,
             preview_enabled,
             preview: None,
@@ -423,10 +509,24 @@ impl App {
                 // The last scan is shown at once, so the window opens with
                 // its albums and playlists in place; the scan that follows
                 // picks up whatever changed.
-                if !smoke && let Some(library) = crate::library::read_cache(&directory) {
-                    app.adopt_library(library);
+                let cached = if !smoke {
+                    match crate::library::read_cache(&directory) {
+                        Some(library) => {
+                            app.adopt_library(library);
+                            true
+                        }
+                        None => false,
+                    }
+                } else {
+                    false
+                };
+                // The scan at startup is one of the two the automatic scan
+                // covers. A directory the cache knows nothing about is
+                // scanned anyway: an empty window would leave nothing to play,
+                // and the next start would learn nothing about the directory.
+                if app.auto_scan || !cached {
+                    app.start_scan(directory);
                 }
-                app.start_scan(directory)
             }
             None => {
                 // A path on the command line says where the music is, which
@@ -765,7 +865,99 @@ impl App {
     /// Scans `directory`, replacing the library when the scan finishes.
     pub fn start_scan(&mut self, directory: PathBuf) {
         self.status = None;
+        self.scan_quiet = false;
         self.scan = Some((crate::library::spawn_scan(directory, self.ignore_hidden), 0));
+    }
+
+    /// Scans `directory` on the timer's behalf, taking in only what changed.
+    ///
+    /// It is the same scan as a rescan by hand, but its answer is read
+    /// quietly: a scan that found nothing new answers a library the window
+    /// already lists, and taking that in would rebuild it, put the album list
+    /// back where it started and write the session file, for nothing.
+    fn start_quiet_scan(&mut self, directory: PathBuf) {
+        self.scan_quiet = true;
+        self.scan = Some((crate::library::spawn_scan(directory, self.ignore_hidden), 0));
+    }
+
+    /// Starts the scan that is due, when one is.
+    ///
+    /// A change the watcher reported is scanned once the burst that caused it
+    /// has ended; the timer is what catches a library on storage that reports
+    /// nothing at all. Nothing is scanned with a scan already running, with
+    /// no directory to scan, or with the automatic scan turned off.
+    fn scan_when_due(&mut self) {
+        if !self.auto_scan || self.scan.is_some() {
+            return;
+        }
+        match self.scan_after {
+            // The burst is still arriving, and every event pushes this back.
+            Some(after) if Instant::now() < after => return,
+            Some(_) => self.scan_after = None,
+            // Nothing was reported: only the fallback is left to be due.
+            None if matches!(self.scanned_at, Some(at) if at.elapsed() < SCAN_EVERY) => return,
+            None => {}
+        }
+        let Some(directory) = self.config.music_directory.clone() else {
+            return;
+        };
+        self.start_quiet_scan(directory);
+    }
+
+    /// How long until a scan is due.
+    ///
+    /// `None` when no scan is due at all: the automatic scan is off, there is
+    /// no directory to scan, or a scan is already running, which says so in
+    /// its own way.
+    fn scan_due_in(&self) -> Option<Duration> {
+        if !self.auto_scan || self.scan.is_some() || self.config.music_directory.is_none() {
+            return None;
+        }
+        Some(match (self.scan_after, self.scanned_at) {
+            (Some(after), _) => after.saturating_duration_since(Instant::now()),
+            (None, Some(at)) => SCAN_EVERY.saturating_sub(at.elapsed()),
+            (None, None) => Duration::ZERO,
+        })
+    }
+
+    /// Watches the music directory, or stops watching the one it watched.
+    ///
+    /// Called once a frame and cheap when there is nothing to do: it starts a
+    /// watch when one is wanted and none is running on the directory the
+    /// library is read from, and drops it when the automatic scan is turned
+    /// off or the directory changes.
+    fn watch_directory(&mut self, ctx: &egui::Context) {
+        let wanted = self
+            .auto_scan
+            .then(|| self.config.music_directory.clone())
+            .flatten();
+        let Some(directory) = wanted else {
+            self.watch = None;
+            return;
+        };
+        if let Some(watch) = &self.watch {
+            // A watch that ended -- the directory was removed, renamed or
+            // unmounted -- is replaced rather than kept: it reports nothing
+            // from here on, and the path still matching would hide that.
+            if watch.root() == directory && !watch.ended() {
+                return;
+            }
+            self.watch = None;
+        }
+        if matches!(&self.watch_failed, Some((root, at)) if *root == directory && at.elapsed() < WATCH_RETRY)
+        {
+            return;
+        }
+        self.watch = None;
+        let ctx = ctx.clone();
+        let wake: crate::watch::Waker = std::sync::Arc::new(move || ctx.request_repaint());
+        match crate::watch::spawn(&directory, wake) {
+            Some(watch) => {
+                self.watch = Some(watch);
+                self.watch_failed = None;
+            }
+            None => self.watch_failed = Some((directory, Instant::now())),
+        }
     }
 
     /// Opens a directory, remembers it and scans it.
@@ -777,7 +969,21 @@ impl App {
 
     /// Takes in what the background threads have finished.
     fn poll_workers(&mut self, ctx: &egui::Context) {
+        // A change under the music directory is scanned once the burst that
+        // caused it has ended, so a copy of an album is one scan rather than
+        // one per file.
+        self.watch_directory(ctx);
+        if self
+            .watch
+            .as_ref()
+            .is_some_and(crate::watch::Watch::changed)
+        {
+            self.scan_after = Some(Instant::now() + SETTLE);
+            ctx.request_repaint_after(SETTLE);
+        }
+        self.scan_when_due();
         let mut finished = false;
+        let mut failed = false;
         let mut scanned: Option<Box<Library>> = None;
         if let Some((receiver, seen)) = &mut self.scan {
             while let Ok(message) = receiver.try_recv() {
@@ -789,6 +995,7 @@ impl App {
                     }
                     ScanMessage::Failed(error) => {
                         self.status = Some(error);
+                        failed = true;
                         finished = true;
                     }
                 }
@@ -797,10 +1004,26 @@ impl App {
         // The scan has to end before the library is swapped in, since the
         // playlists have to be carried over to it.
         if let Some(library) = scanned {
-            self.adopt_library(*library);
+            // A scan the timer started answers with the same library as often
+            // as not, and taking that in would undo what the window shows for
+            // nothing.
+            if !self.scan_quiet || !self.library.same_as(&library) {
+                self.adopt_library(*library);
+            }
         }
         if finished {
             self.scan = None;
+            self.scan_quiet = false;
+            // The timer counts from the end of a scan, so a scan of a large
+            // directory is not followed by another the moment it lands. A
+            // scan that failed is not a scan, though: it read nothing, so the
+            // next one is a minute off rather than an hour, which is the case
+            // an unmounted share runs into and comes back from.
+            if failed {
+                self.scan_after = Some(Instant::now() + WATCH_RETRY);
+            } else {
+                self.scanned_at = Some(Instant::now());
+            }
             if self.library.is_empty() && self.status.is_none() {
                 self.status = Some("No music found in that directory".to_string());
             }
@@ -851,6 +1074,11 @@ impl App {
             || self.pictures.pending()
         {
             ctx.request_repaint_after(Duration::from_millis(120));
+        } else if let Some(wait) = self.scan_due_in() {
+            // The timer is read once a frame, and an idle window draws none:
+            // without this the scan due in a minute would wait for the next
+            // key press or pointer move to run.
+            ctx.request_repaint_after(wait.max(Duration::from_millis(120)));
         }
     }
 
@@ -921,6 +1149,13 @@ impl App {
     /// than moving on, so one press goes to its start and a second goes to
     /// the track before it.
     pub fn step(&mut self, forward: bool) {
+        // The preview has no playlist behind it, so there is nothing to step
+        // to; the keyboard would otherwise walk the library out from under a
+        // window that is showing one file, and MPRIS would then name the
+        // preview while the library played.
+        if self.preview.is_some() {
+            return;
+        }
         let Some(current) = self.playing.or(self.view.selected) else {
             if let Some(&first) = self.playlists.current().tracks.first() {
                 self.play(first);
@@ -1474,6 +1709,12 @@ impl App {
     /// Playing a row by hand goes back to walking the playlist, rather than
     /// the queue an earlier selection started.
     pub fn play_selection(&mut self) {
+        // A row cannot be played while the preview shows: the preview window
+        // draws no table, so a press that reached here came from the keyboard
+        // on a window whose rows are not there.
+        if self.preview.is_some() {
+            return;
+        }
         let Some(index) = self.view.selected else {
             return;
         };
@@ -1551,11 +1792,103 @@ impl App {
             return None;
         };
         let cover = cover?;
-        let image =
-            egui::ColorImage::from_rgba_unmultiplied([cover.width, cover.height], &cover.rgba);
-        let texture = ctx.load_texture(format!("cover-{key}"), image, egui::TextureOptions::LINEAR);
+        let texture = upload(ctx, key, &cover);
         self.textures.insert(key.to_string(), texture.clone());
         Some(texture)
+    }
+
+    /// Texture for the cover of the loaded track, at the size it is drawn.
+    ///
+    /// The album lists draw covers the size of a row, which the thumbnail
+    /// decoded for them fills exactly. The square above the controls is drawn
+    /// as wide as the window instead, so the thumbnail stretched over it reads
+    /// blurry: the picture is decoded again at the size that square has, in
+    /// whole pixels of the screen, and kept as the one texture the window
+    /// shows at that size. Dropping the pixels once they are uploaded is what
+    /// keeps that from being a cover per track ever played: a decoded picture
+    /// this large is a few megabytes, and the textures are what is worth
+    /// keeping.
+    ///
+    /// A picture still being decoded leaves the thumbnail on screen rather
+    /// than nothing, so the art does not blink as the square takes a new size.
+    pub fn playing_art(&mut self, ctx: &egui::Context, side: f32) -> Option<egui::TextureHandle> {
+        let Some(key) = self.loaded_cover_key() else {
+            // Nothing loaded, so the big picture of the last track is dropped
+            // rather than kept for a square that no longer shows art.
+            self.big_art = None;
+            self.wait_for_big(None);
+            return None;
+        };
+        let pixels = (side * ctx.pixels_per_point()).round().max(1.0) as u32;
+        let size = crate::cover::decoded_size(pixels);
+        if size <= crate::cover::THUMBNAIL {
+            // The square is small enough that the thumbnail fills it, so the
+            // picture of its own size is not wanted any more either.
+            self.big_art = None;
+            self.wait_for_big(None);
+            return self.cover_texture(ctx, &key);
+        }
+        if let Some(big) = &self.big_art {
+            if big.side == size && big.key == key {
+                return Some(big.texture.clone());
+            }
+            // The square has taken another size, or another track is loaded:
+            // the texture held is not one this frame draws, and keeping it
+            // would collect one per step of a resize.
+            self.big_art = None;
+        }
+        let asked = crate::art::sized_key(&key, size);
+        self.wait_for_big(Some(&asked));
+        let Some(cover) = self.pictures.decoded(&asked) else {
+            self.pictures.request(&asked);
+            return self.cover_texture(ctx, &key);
+        };
+        let Some(cover) = cover else {
+            // No picture behind the key, which the thumbnail path has already
+            // answered for.
+            return self.cover_texture(ctx, &key);
+        };
+        let texture = upload(ctx, &asked, &cover);
+        self.pictures.forget(&[asked]);
+        self.big_art = Some(BigArt {
+            key,
+            side: size,
+            texture: texture.clone(),
+        });
+        Some(texture)
+    }
+
+    /// Makes `key` the picture size the square is waiting for, dropping the
+    /// one it waited for before.
+    ///
+    /// A size the square grew past is not waited for: its decode is a few
+    /// megabytes, and the frame that asked for it is not the frame that draws
+    /// it any more. Dropping it here is what keeps a window widened while the
+    /// picture decoded from holding both sizes, the smaller one for good.
+    fn wait_for_big(&mut self, key: Option<&str>) {
+        if self.big_asked.as_deref() == key {
+            return;
+        }
+        if let Some(previous) = self.big_asked.take() {
+            self.pictures.forget(&[previous]);
+        }
+        self.big_asked = key.map(str::to_string);
+    }
+
+    /// The key of the cover of the loaded track, when it has one.
+    ///
+    /// An album's cover is shared by its tracks; a loose track has no album
+    /// to take one from, so its own artwork is used. The preview's file is in
+    /// no library, so its cover is the file's own.
+    fn loaded_cover_key(&self) -> Option<String> {
+        if let Some(preview) = &self.preview {
+            return preview.cover.clone();
+        }
+        let track = self.playing?;
+        if let Some(album) = self.album_of(track) {
+            return self.library.albums.get(album)?.cover.clone();
+        }
+        self.library.tracks.get(track)?.cover.clone()
     }
 
     /// Texture for an album's cover.
@@ -1589,24 +1922,6 @@ impl App {
                     .get(track)
                     .is_some_and(|track| track.cover.is_some())
         })
-    }
-
-    /// Texture for the cover of the playing track.
-    ///
-    /// An album's cover is shared by its tracks; a loose track has no album
-    /// to take one from, so its own artwork is used. The two are kept in the
-    /// same cache under different keys.
-    pub fn playing_cover(&mut self, ctx: &egui::Context) -> Option<egui::TextureHandle> {
-        if let Some(preview) = &self.preview {
-            let key = preview.cover.clone()?;
-            return self.cover_texture(ctx, &key);
-        }
-        let track = self.playing?;
-        if let Some(album) = self.album_of(track) {
-            return self.album_cover(ctx, album);
-        }
-        let key = self.library.tracks.get(track)?.cover.clone()?;
-        self.cover_texture(ctx, &key)
     }
 
     /// The playback position, following the seek bar while it is dragged.
@@ -1731,6 +2046,23 @@ impl App {
         self.save_settings();
     }
 
+    /// Turns the automatic scan on or off, and remembers it.
+    ///
+    /// Switching it on scans at once: the setting covers the scan at startup
+    /// and the one on a timer, and waiting a minute is long enough for the
+    /// new setting to look as though it did nothing.
+    pub fn set_auto_scan(&mut self, auto_scan: bool) {
+        self.auto_scan = auto_scan;
+        self.config.auto_scan = Some(auto_scan);
+        self.save_settings();
+        if auto_scan
+            && self.scan.is_none()
+            && let Some(directory) = self.config.music_directory.clone()
+        {
+            self.start_scan(directory);
+        }
+    }
+
     /// Leaves hidden files out of the scan, or stops doing so.
     ///
     /// The scan has to run again for the change to show: what is in the
@@ -1841,11 +2173,27 @@ impl App {
             .and_then(|index| track_path(&self.library, index));
 
         // A scan that finds nothing, with a playlist that held something, is
-        // a directory that went away rather than one that was emptied; the
-        // session is left as it was so the next run can still open it.
-        let vanished = library.is_empty() && paths.iter().any(|tracks| !tracks.is_empty());
+        // a directory that went away rather than one that was emptied: the
+        // library the window lists, the playlists and the session are all left
+        // as they were. Taking the empty answer in would empty the window
+        // under the user, with every row it drew pointing at nothing, which is
+        // what an unmounted share looks like from here.
+        if library.is_empty() && paths.iter().any(|tracks| !tracks.is_empty()) {
+            return;
+        }
+
+        // The queue a "play the selection" started is indices into the track
+        // list about to be replaced, so it is found again by path, the way the
+        // playlists are.
+        let queue: Option<Vec<PathBuf>> = self.queue.as_ref().map(|indices| {
+            indices
+                .iter()
+                .filter_map(|&index| track_path(&self.library, index))
+                .collect()
+        });
 
         self.library = library;
+        self.remap_queue(queue);
         // Textures and decoded pictures are keyed by the content of a cover,
         // so a rescan that names the same ones keeps them: clearing both would
         // blink the visible art back to placeholders and decode it again.
@@ -1859,13 +2207,33 @@ impl App {
         self.pictures.prefetch(covers);
         self.view.album = (!self.library.albums.is_empty()).then_some(0);
 
-        if vanished {
-            return;
-        }
         if paths.iter().any(|tracks| !tracks.is_empty()) {
             self.remap_playlists(paths, selected, playing);
         } else {
             self.restore_playlists();
+        }
+    }
+
+    /// Finds the walking queue again in the library just scanned.
+    ///
+    /// A queue holds indices into the track list, which a scan replaces: a
+    /// file added above the playing track shifts every index below it, and the
+    /// next step would walk to a track that is not there, which stops playback
+    /// without a word. The shuffle order is dropped rather than remapped,
+    /// since it is a drawn order and drawing it again costs nothing.
+    fn remap_queue(&mut self, queue: Option<Vec<PathBuf>>) {
+        if let Some(paths) = queue {
+            let positions = track_positions(&self.library);
+            let found: Vec<usize> = paths
+                .iter()
+                .filter_map(|path| positions.get(path.as_path()).copied())
+                .collect();
+            // A queue whose tracks all went away falls back to the playlist,
+            // which is what walking it would do by hand.
+            self.queue = (!found.is_empty()).then_some(found);
+        }
+        if self.shuffle.is_some() {
+            self.forget_shuffle();
         }
     }
 
@@ -2216,8 +2584,22 @@ impl App {
         self.requests = Some(crate::instance::serve(listener, waker));
     }
 
+    /// Whether a command from a D-Bus client applies to what plays now.
+    ///
+    /// The preview plays one file with no playlist behind it, so Play and
+    /// Pause are the only transport it has: a step would leave the file for a
+    /// track of the playlist the preview never touched, and a stop has
+    /// nowhere to put the window back to.
+    fn remote_command_applies(&self, command: Command) -> bool {
+        self.preview.is_none()
+            || !matches!(command, Command::Next | Command::Previous | Command::Stop)
+    }
+
     /// Carries out one command from a D-Bus client.
     fn apply(&mut self, command: Command) {
+        if !self.remote_command_applies(command) {
+            return;
+        }
         match command {
             Command::Play if self.playing.is_none() || self.paused() => self.toggle(),
             Command::Play => {}
@@ -2247,17 +2629,25 @@ impl App {
         }
     }
 
-    /// The art file MPRIS names for the playing track, when it has a cover.
+    /// The art file MPRIS names for the loaded track, when it has a cover.
     ///
     /// The picture is written once per track and kept: a frame that encoded
     /// it again would spend more time on the PNG than on the window. What is
     /// kept is dropped as soon as nothing plays, so a stop leaves the
     /// metadata without art rather than with the art of the last track.
     fn art_path(&mut self) -> Option<PathBuf> {
-        if self.playing.is_none() {
+        let Some(cover_key) = self.described_track().map(|track| track.cover.clone()) else {
+            // Nothing is loaded, so the art of the last track is forgotten
+            // rather than left beside an empty title.
             self.art = None;
             return None;
-        }
+        };
+        let Some(key) = cover_key else {
+            // The loaded track carries no cover, which is remembered so a
+            // later frame does not look for one again.
+            self.art = Some(None);
+            return None;
+        };
         match &self.art {
             // Nothing to write for this track, or a write that failed once
             // and would fail the same way on the next frame.
@@ -2265,24 +2655,32 @@ impl App {
             Some(Some(path)) if path.is_file() => return Some(path.clone()),
             _ => {}
         }
-        let key = self
-            .playing
-            .and_then(|index| self.library.tracks.get(index))
-            .and_then(|track| track.cover.clone());
         // The picture is usually on screen already, so it is taken from there;
         // a track that plays without being drawn is decoded here instead.
-        let cover = key
-            .as_deref()
-            .and_then(|key| match self.pictures.decoded(key) {
-                Some(cover) => cover,
-                None => crate::art::decode_now(key).map(std::sync::Arc::new),
-            });
-        let path = match (key.as_deref(), cover.as_deref()) {
-            (Some(key), Some(cover)) => crate::cache::art_file(key, cover),
-            _ => None,
+        let cover = match self.pictures.decoded(&key) {
+            Some(cover) => cover,
+            None => crate::art::decode_now(&key).map(std::sync::Arc::new),
         };
+        let path = cover
+            .as_deref()
+            .and_then(|cover| crate::cache::art_file(&key, cover));
         self.art = Some(path.clone());
         path
+    }
+
+    /// The track MPRIS describes: the preview's when one is showing, else the
+    /// track that plays.
+    ///
+    /// A previewed file is read on its own and is in no playlist, so it has no
+    /// index into the library. Asking the library for the playing track alone
+    /// would leave a client with no title, no album and no art for the one file
+    /// the window is looking at.
+    fn described_track(&self) -> Option<&Track> {
+        if let Some(preview) = &self.preview {
+            return Some(preview);
+        }
+        self.playing
+            .and_then(|index| self.library.tracks.get(index))
     }
 
     /// Tells the service what the player is doing.
@@ -2290,12 +2688,18 @@ impl App {
         if self.mpris.is_none() {
             return;
         }
+        let state = self.mpris_state();
+        if let Some(service) = &self.mpris {
+            service.update(state);
+        }
+    }
+
+    /// What the player tells a client about itself.
+    fn mpris_state(&mut self) -> crate::mpris::State {
         // The art is written before the tracks are borrowed, since writing it
         // needs the app mutably.
         let art = self.art_path();
-        let track = self
-            .playing
-            .and_then(|index| self.library.tracks.get(index));
+        let track = self.described_track();
         let title = track.map(|track| track.title.clone()).unwrap_or_default();
         let artists: Vec<String> = track
             .map(|track| {
@@ -2309,13 +2713,17 @@ impl App {
             })
             .unwrap_or_default();
         let album = track.map(|track| track.album.clone()).unwrap_or_default();
-        let playback = match self.playing {
-            None => Playback::Stopped,
-            Some(_) if self.paused() => Playback::Paused,
-            Some(_) => Playback::Playing,
+        let loaded = track.is_some();
+        // The preview is one file, and the playlist it was opened over is not
+        // what it walks: a client offered Next there would step out of the
+        // file and into a track the listener never asked for.
+        let stepable = self.preview.is_none() && self.walked_tracks().len() > 1;
+        let playback = match loaded {
+            false => Playback::Stopped,
+            true if self.paused() => Playback::Paused,
+            true => Playback::Playing,
         };
-        let queue = self.walked_tracks().len();
-        let state = crate::mpris::State {
+        crate::mpris::State {
             playback,
             title,
             artists,
@@ -2325,14 +2733,15 @@ impl App {
             volume: f64::from(self.volume),
             repeat: self.repeat,
             shuffle: self.random,
-            can_seek: self.playing.is_some() && !self.length.is_zero(),
-            can_go_next: queue > 1,
-            can_go_previous: queue > 1,
-            track: self.playing.map_or(0, |index| index as u64),
+            can_seek: loaded && !self.length.is_zero(),
+            can_go_next: stepable,
+            can_go_previous: stepable,
+            track: match (self.preview.is_some(), self.playing) {
+                (true, _) => PREVIEW_TRACK,
+                (false, Some(index)) => index as u64,
+                (false, None) => 0,
+            },
             art,
-        };
-        if let Some(service) = &self.mpris {
-            service.update(state);
         }
     }
 
@@ -2527,6 +2936,15 @@ fn sane_columns(stored: [f32; 6]) -> [f32; 6] {
 /// The file the track at `index` came from, for saving it or finding it again.
 fn track_path(library: &Library, index: usize) -> Option<PathBuf> {
     library.tracks.get(index).map(|track| track.path.clone())
+}
+
+/// Uploads `cover` as a texture the window draws.
+///
+/// The picture arrives from the decoder thread in RGBA, which is what egui
+/// takes, so nothing is converted here.
+fn upload(ctx: &egui::Context, key: &str, cover: &crate::cover::Cover) -> egui::TextureHandle {
+    let image = egui::ColorImage::from_rgba_unmultiplied([cover.width, cover.height], &cover.rgba);
+    ctx.load_texture(format!("cover-{key}"), image, egui::TextureOptions::LINEAR)
 }
 
 /// Where each track of `library` sits, by the file it came from.
@@ -3018,6 +3436,128 @@ pub(crate) mod tests {
             queued,
             "the playlist is untouched"
         );
+    }
+
+    #[test]
+    fn mpris_describes_the_previewed_file() {
+        // The preview reads its file on its own and is in no playlist, so what
+        // a client shows has to come from that file: a title, an album and an
+        // artist taken from the library would describe a track that is not
+        // playing, and the player would read as stopped while it plays.
+        let mut app = app_with(&[("One", &["A", "B"])]);
+        let path = app.library.tracks[0].path.clone();
+        app.open_preview(&egui::Context::default(), &path);
+        assert!(app.playing.is_none(), "the preview leaves the list alone");
+
+        let state = app.mpris_state();
+        assert_eq!(state.title, "A");
+        assert_eq!(state.album, "One");
+        assert_eq!(
+            state.artists,
+            ["Unknown Artist"],
+            "the artist is the file's own, not the library row's"
+        );
+        assert_ne!(
+            state.playback,
+            Playback::Stopped,
+            "a file the window is showing is not stopped"
+        );
+        assert_eq!(state.track, PREVIEW_TRACK, "the preview is no playlist row");
+    }
+
+    #[test]
+    fn mpris_names_the_previews_art() {
+        // A media widget draws the art from the URI in the metadata, so the
+        // picture of a previewed file has to be written out like any other.
+        let mut app = app_with(&[("One", &["A"])]);
+        let path = app.library.tracks[0].path.clone();
+        app.open_preview(&egui::Context::default(), &path);
+
+        let cover = crate::cover::Cover {
+            width: 2,
+            height: 2,
+            rgba: vec![1, 2, 3, 255, 4, 5, 6, 255, 7, 8, 9, 255, 10, 11, 12, 255],
+        };
+        let bytes = crate::cover::to_png(&cover).expect("the picture encodes");
+        let key = crate::cache::store_cover(&bytes).expect("the picture is stored");
+        app.preview.as_mut().expect("the preview is showing").cover = Some(key);
+
+        let state = app.mpris_state();
+        assert!(state.art.is_some(), "the previewed file's art is named");
+    }
+
+    #[test]
+    fn the_preview_offers_no_next_or_previous() {
+        // The file a preview plays is in no playlist, so a client that was
+        // offered Next would step into whatever the playlist happens to hold
+        // and leave the file behind.
+        let mut app = app_with(&[("One", &["A", "B", "C"])]);
+        let path = app.library.tracks[0].path.clone();
+        app.open_preview(&egui::Context::default(), &path);
+
+        let state = app.mpris_state();
+        assert!(!state.can_go_next, "there is no track after the file");
+        assert!(!state.can_go_previous, "and none before it");
+
+        // A playlist with rows either side of the playing one offers both.
+        let mut playing = app_with(&[("One", &["A", "B", "C"])]);
+        playing.playing = Some(0);
+        let state = playing.mpris_state();
+        assert!(state.can_go_next && state.can_go_previous);
+    }
+
+    #[test]
+    fn the_preview_answers_play_and_pause_only() {
+        let mut app = app_with(&[("One", &["A", "B"])]);
+        let path = app.library.tracks[0].path.clone();
+        app.open_preview(&egui::Context::default(), &path);
+
+        assert!(app.remote_command_applies(Command::Play));
+        assert!(app.remote_command_applies(Command::Pause));
+        assert!(app.remote_command_applies(Command::PlayPause));
+        assert!(app.remote_command_applies(Command::Seek(1_000_000)));
+        assert!(!app.remote_command_applies(Command::Next));
+        assert!(!app.remote_command_applies(Command::Previous));
+        assert!(!app.remote_command_applies(Command::Stop));
+    }
+
+    #[test]
+    fn the_preview_does_not_start_the_library_behind_it() {
+        // The preview shows one file, with no playlist behind it, and the
+        // keyboard transport still reaches step() and play_selection().
+        // Walking the library there plays a track the window does not show,
+        // and MPRIS then reports the previewed file while the library plays.
+        //
+        // A play of these tracks cannot succeed, since their files are not
+        // there, so the status line is what says whether one was even tried.
+        let mut app = app_with(&[("One", &["A", "B"]), ("Two", &["C"])]);
+        app.preview = Some(app.library.tracks[0].clone());
+        app.view.selected = Some(1);
+        app.status = None;
+
+        app.step(true);
+        assert_eq!(app.playing, None, "the preview is not stepped away from");
+        assert!(app.status.is_none(), "and no track was started");
+
+        app.play_selection();
+        assert_eq!(app.playing, None, "the selected row is not played");
+        assert!(app.status.is_none(), "and no track was started");
+    }
+
+    #[test]
+    fn a_playlist_play_answers_a_step_and_a_stop() {
+        let app = app_with(&[("One", &["A", "B"])]);
+        for command in [
+            Command::Next,
+            Command::Previous,
+            Command::Stop,
+            Command::Play,
+        ] {
+            assert!(
+                app.remote_command_applies(command),
+                "{command:?} applies to the playlist"
+            );
+        }
     }
 
     #[test]
@@ -3817,6 +4357,133 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_picture_size_the_square_grew_past_is_not_kept() {
+        // A window widened while the picture decoded asks for a second size
+        // before the first lands. Both would be held, a cover of that size
+        // being a few megabytes, though nothing draws the smaller one again.
+        fn stored(width: usize) -> String {
+            let cover = crate::cover::Cover {
+                width,
+                height: width,
+                rgba: [10, 20, 30, 255].repeat(width * width),
+            };
+            let bytes = crate::cover::to_png(&cover).expect("the picture encodes");
+            crate::cache::store_cover(&bytes).expect("the picture is stored")
+        }
+
+        let mut app = app_with(&[("One", &["A"])]);
+        let key = stored(800);
+        let mut track = app.library.tracks[0].clone();
+        track.cover = Some(key.clone());
+        app.library = Library::from_tracks(vec![track]);
+        app.open_album(0);
+        app.playing = Some(0);
+
+        let ctx = egui::Context::default();
+        let small = crate::art::sized_key(&key, 640);
+        let large = crate::art::sized_key(&key, 896);
+        // The square is 600 points wide, and the window is widened to 700
+        // before the picture of that size lands. Nothing polls in between, so
+        // the smaller ask is still outstanding when the larger one is made.
+        app.playing_art(&ctx, 600.0);
+        app.playing_art(&ctx, 700.0);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while app.pictures.decoded(&large).is_none() {
+            app.pictures.poll();
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the picture of the size the square is drawn at never arrived"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+
+        assert!(
+            app.pictures.decoded(&small).is_none(),
+            "the size the square grew past is not held"
+        );
+    }
+
+    #[test]
+    fn the_big_square_is_drawn_from_art_of_its_own_size() {
+        // The album lists draw a cover the size of a row, which a thumbnail
+        // fills. The square above the controls is drawn as wide as the
+        // window, so it asks for the picture at that size instead of
+        // stretching a thumbnail over it and reading blurry.
+        fn stored(width: usize) -> String {
+            let cover = crate::cover::Cover {
+                width,
+                height: width,
+                rgba: [10, 20, 30, 255].repeat(width * width),
+            };
+            let bytes = crate::cover::to_png(&cover).expect("the picture encodes");
+            crate::cache::store_cover(&bytes).expect("the picture is stored")
+        }
+
+        /// Draws the square until the picture arrives, and answers its texture.
+        fn settle(app: &mut App, ctx: &egui::Context, side: f32) -> egui::TextureHandle {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            loop {
+                app.pictures.poll();
+                // Until the picture of its own size lands, the square answers
+                // with the thumbnail, so what says it landed is the texture
+                // being wider than one.
+                if let Some(texture) = app.playing_art(ctx, side)
+                    && texture.size()[0] > crate::cover::THUMBNAIL as usize
+                {
+                    return texture;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the picture of its own size never arrived"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        }
+
+        let mut app = app_with(&[("One", &["A"])]);
+        let key = stored(800);
+        let mut track = app.library.tracks[0].clone();
+        track.cover = Some(key);
+        app.library = Library::from_tracks(vec![track]);
+        app.open_album(0);
+        app.playing = Some(0);
+
+        let ctx = egui::Context::default();
+        // A square 600 points wide on a screen with no scaling is 600 pixels
+        // of art, rounded up to the next size a cover is decoded at.
+        let texture = settle(&mut app, &ctx, 600.0);
+        assert_eq!(
+            texture.size(),
+            [640, 640],
+            "the picture is decoded at the size the square is drawn"
+        );
+        let key = app
+            .library
+            .tracks
+            .first()
+            .and_then(|track| track.cover.clone())
+            .expect("the cover is named");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let thumbnail = loop {
+            app.pictures.poll();
+            if let Some(texture) = app.cover_texture(&ctx, &key) {
+                break texture;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the thumbnail never arrived"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        };
+        assert_eq!(
+            thumbnail.size(),
+            [256, 256],
+            "the list keeps its thumbnail, so both sizes are available"
+        );
+    }
+
+    #[test]
     fn a_stopped_player_names_no_art() {
         // The art file is kept for the track that is playing, so a stop has
         // to drop it: the metadata would otherwise carry the cover of a track
@@ -3876,6 +4543,53 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_scan_that_finds_nothing_does_not_empty_the_window() {
+        // A directory that went away answers an empty library. Taking that in
+        // would empty the album list under the user, with every row it drew
+        // pointing at a track that is no longer there, which is what an
+        // unmounted share looks like from here.
+        let mut app = app_with(&[("One", &["A", "B"]), ("Two", &["C"])]);
+        app.playing = Some(1);
+
+        app.adopt_library(Library::default());
+
+        assert_eq!(app.library.tracks.len(), 3, "the library is kept");
+        assert_eq!(app.view.album, Some(0), "and so is the album it shows");
+        assert_eq!(app.playing, Some(1), "and the track that plays");
+    }
+
+    #[test]
+    fn a_rescan_keeps_the_walking_queue_on_the_same_tracks() {
+        // The queue a "play the selection" started is indices into the track
+        // list, and a scan replaces that list: a file that arrives above a
+        // queued track shifts every index below it, and the next step walks
+        // to a track that is not there, which stops playback without a word.
+        let mut app = app_with(&[("One", &["A", "B"]), ("Two", &["C"])]);
+        app.queue = Some(vec![1, 2]);
+        app.shuffle = Some(vec![0, 1, 2]);
+        let queued: Vec<PathBuf> = [1, 2]
+            .iter()
+            .map(|&index| app.library.tracks[index].path.clone())
+            .collect();
+
+        // A file that sorts before every track listed arrives.
+        let mut tracks = vec![track("One", 1, "0")];
+        tracks.extend(app.library.tracks.clone());
+        app.adopt_library(Library::from_tracks(tracks));
+
+        let queue = app.queue.clone().expect("the queue is kept");
+        let after: Vec<PathBuf> = queue
+            .iter()
+            .map(|&index| app.library.tracks[index].path.clone())
+            .collect();
+        assert_eq!(after, queued, "the queue names the same files");
+        assert!(
+            app.shuffle.is_none(),
+            "the shuffled order is drawn again rather than remapped"
+        );
+    }
+
+    #[test]
     fn a_scan_that_finds_nothing_leaves_the_session_alone() {
         let mut app = app_with(&[("One", &["A"])]);
         app.adopt_library(Library::default());
@@ -3885,6 +4599,296 @@ pub(crate) mod tests {
             [0],
             "the playlist is kept for when the directory comes back"
         );
+    }
+
+    /// A scan that has already answered, so a frame can take it in.
+    fn finished(library: Library) -> Receiver<ScanMessage> {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let _ = sender.send(ScanMessage::Done(Box::new(library)));
+        receiver
+    }
+
+    /// A scan that has already failed, so a frame can take it in.
+    fn failed(error: &str) -> Receiver<ScanMessage> {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let _ = sender.send(ScanMessage::Failed(error.to_string()));
+        receiver
+    }
+
+    #[test]
+    fn a_scan_that_failed_is_not_counted_as_a_scan() {
+        // A share that is unmounted mid-session fails one scan. Counting that
+        // as a scan would leave the next one an hour off, on exactly the
+        // storage the fallback is there for.
+        let mut app = app_with(&[("One", &["A"])]);
+        app.config.music_directory = Some(std::env::temp_dir());
+        app.auto_scan = true;
+        app.scanned_at = None;
+        app.scan = Some((failed("that directory is not there"), 0));
+
+        app.poll_workers(&egui::Context::default());
+
+        assert!(app.scan.is_none(), "the scan ended");
+        assert!(
+            app.scanned_at.is_none(),
+            "a scan that read nothing does not count as a scan"
+        );
+        assert!(
+            app.scan_after
+                .is_some_and(|after| after <= Instant::now() + WATCH_RETRY),
+            "so the next one is a minute off rather than an hour"
+        );
+
+        // And the retry is not the next frame: a share that is still away
+        // would fail again on every one of them.
+        app.poll_workers(&egui::Context::default());
+        assert!(app.scan.is_none(), "the retry waits its minute");
+    }
+
+    #[test]
+    fn the_scan_the_timer_runs_leaves_an_unchanged_library_alone() {
+        // A minute of music playing with nothing added answers the library
+        // the window already lists. Taking that in would put the album list
+        // back at its first album and queue pictures it has already drawn.
+        let mut app = app_with(&[("One", &["A", "B"]), ("Two", &["C"])]);
+        app.open_album(1);
+        // With no row selected there is nothing for the library to be rebuilt
+        // around, so a library taken in again shows the first album.
+        app.select(None);
+        let listed = Library::from_tracks(app.library.tracks.clone());
+        app.scan = Some((finished(listed), 0));
+        app.scan_quiet = true;
+
+        app.poll_workers(&egui::Context::default());
+
+        assert!(app.scan.is_none(), "the scan ended");
+        assert!(!app.scan_quiet, "the next scan is a fresh request");
+        assert_eq!(
+            app.view.album,
+            Some(1),
+            "the album list stays on the album it showed"
+        );
+    }
+
+    #[test]
+    fn the_scan_the_timer_runs_takes_in_what_changed() {
+        let mut app = app_with(&[("One", &["A"])]);
+        let mut tracks = app.library.tracks.clone();
+        tracks.push(track("Two", 1, "B"));
+        app.scan = Some((finished(Library::from_tracks(tracks)), 0));
+        app.scan_quiet = true;
+
+        app.poll_workers(&egui::Context::default());
+
+        assert_eq!(app.library.tracks.len(), 2, "the new file is listed");
+        assert_eq!(app.view.album, Some(0), "and the list is rebuilt");
+    }
+
+    #[test]
+    fn a_rescan_by_hand_takes_the_library_in_even_when_nothing_changed() {
+        // The one the user asked for says so by being clicked, so it is taken
+        // in whatever it answers: a rescan that finds the same tracks is not
+        // a reason to look as though the click did nothing.
+        let mut app = app_with(&[("One", &["A", "B"]), ("Two", &["C"])]);
+        app.open_album(1);
+        app.select(None);
+        let listed = Library::from_tracks(app.library.tracks.clone());
+        app.scan = Some((finished(listed), 0));
+
+        app.poll_workers(&egui::Context::default());
+
+        assert_eq!(app.view.album, Some(0), "the library is taken in again");
+    }
+
+    #[test]
+    fn the_fallback_scan_runs_once_an_hour_has_passed() {
+        let mut app = app_with(&[("One", &["A"])]);
+        app.config.music_directory = Some(std::env::temp_dir());
+        app.auto_scan = true;
+        let ctx = egui::Context::default();
+
+        // A run that has not scanned yet is due at once, which is what a
+        // window whose library is empty has to lose nothing by.
+        app.scanned_at = None;
+        app.poll_workers(&ctx);
+        assert!(app.scan.is_some(), "a scan starts when one is due");
+
+        app.scan = None;
+        app.scanned_at = Some(Instant::now());
+        app.poll_workers(&ctx);
+        assert!(
+            app.scan.is_none(),
+            "the fallback is an hour off, and the watch is what notices changes"
+        );
+    }
+
+    #[test]
+    fn a_change_is_scanned_once_it_stops_arriving() {
+        // Copying an album fires a change per file. A scan of each would read
+        // the library over and over, so the scan waits for the burst to end,
+        // and a further change pushes that wait back.
+        let mut app = app_with(&[("One", &["A"])]);
+        // A directory of its own, since anything written to the shared one
+        // while the test runs is a change that pushes the wait back.
+        let directory =
+            std::env::temp_dir().join(format!("blue-dove-settle-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).expect("the directory is made");
+        app.config.music_directory = Some(directory.clone());
+        app.auto_scan = true;
+        app.scanned_at = Some(Instant::now());
+        let ctx = egui::Context::default();
+
+        app.scan_after = Some(Instant::now() + SETTLE);
+        app.poll_workers(&ctx);
+        assert!(app.scan.is_none(), "the burst has not ended yet");
+
+        app.scan_after = Some(Instant::now());
+        app.poll_workers(&ctx);
+        assert!(app.scan.is_some(), "the change is scanned once it has");
+        assert!(
+            app.scan_quiet,
+            "and quietly, since it may well find nothing new"
+        );
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn a_change_under_the_music_directory_is_taken_in() {
+        // This is the whole point of watching instead of polling: a file that
+        // arrives while the window runs sets the wait that ends in a scan,
+        // rather than waiting for the hour the fallback runs on.
+        let directory =
+            std::env::temp_dir().join(format!("blue-dove-watched-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).expect("the directory is made");
+        let mut app = app_with(&[("One", &["A"])]);
+        app.config.music_directory = Some(directory.clone());
+        app.auto_scan = true;
+        app.scanned_at = Some(Instant::now());
+        let ctx = egui::Context::default();
+        app.poll_workers(&ctx);
+        if app.watch.is_none() {
+            // A host that cannot watch a directory has only the fallback.
+            let _ = std::fs::remove_dir_all(&directory);
+            return;
+        }
+        assert!(app.scan_after.is_none(), "nothing has changed yet");
+
+        std::fs::write(directory.join("song.wav"), b"not really audio")
+            .expect("the file is written");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while app.scan_after.is_none() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+            app.poll_workers(&ctx);
+        }
+
+        assert!(
+            app.scan_after.is_some(),
+            "the change is noted, so a scan follows once it settles"
+        );
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn a_watch_that_ended_is_replaced() {
+        // A directory deleted, renamed or unmounted takes its watch with it,
+        // and the kernel says so once. Keeping the dead watch because its path
+        // still matches leaves the hourly fallback as the only thing that
+        // notices, so a file written after the directory comes back stays
+        // invisible for an hour.
+        let directory =
+            std::env::temp_dir().join(format!("blue-dove-replaced-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).expect("the directory is made");
+        let mut app = app_with(&[("One", &["A"])]);
+        app.config.music_directory = Some(directory.clone());
+        app.auto_scan = true;
+        let ctx = egui::Context::default();
+        app.poll_workers(&ctx);
+        if app.watch.is_none() {
+            // A host that cannot watch a directory has only the fallback.
+            let _ = std::fs::remove_dir_all(&directory);
+            return;
+        }
+
+        std::fs::remove_dir_all(&directory).expect("the directory goes");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !app.watch.as_ref().is_some_and(crate::watch::Watch::ended)
+            && Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            app.watch.as_ref().is_some_and(crate::watch::Watch::ended),
+            "the watch on the removed directory ended"
+        );
+
+        // The directory comes back, and with it a watch that reports changes.
+        std::fs::create_dir_all(&directory).expect("the directory comes back");
+        app.poll_workers(&ctx);
+        assert!(
+            app.watch.as_ref().is_some_and(|watch| !watch.ended()),
+            "a live watch is placed on the directory that came back"
+        );
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn a_watch_is_started_on_the_music_directory() {
+        let mut app = app_with(&[("One", &["A"])]);
+        let directory =
+            std::env::temp_dir().join(format!("blue-dove-autoscan-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).expect("the directory is made");
+        app.config.music_directory = Some(directory.clone());
+        app.auto_scan = true;
+
+        app.poll_workers(&egui::Context::default());
+
+        assert!(
+            app.watch
+                .as_ref()
+                .is_some_and(|watch| watch.root() == directory),
+            "the directory the library is read from is the one watched"
+        );
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn turning_the_automatic_scan_off_stops_the_watch() {
+        let mut app = app_with(&[("One", &["A"])]);
+        app.config.music_directory = Some(std::env::temp_dir());
+        app.auto_scan = true;
+        app.poll_workers(&egui::Context::default());
+
+        app.set_auto_scan(false);
+        app.poll_workers(&egui::Context::default());
+
+        assert!(app.watch.is_none(), "nothing is watched with it off");
+    }
+
+    #[test]
+    fn the_automatic_scan_can_be_turned_off() {
+        let mut app = app_with(&[("One", &["A"])]);
+        app.config.music_directory = Some(std::env::temp_dir());
+        app.set_auto_scan(false);
+        app.scanned_at = None;
+
+        app.poll_workers(&egui::Context::default());
+
+        assert!(app.scan.is_none(), "nothing is scanned with the timer off");
+        assert_eq!(app.config.auto_scan, Some(false), "and it is remembered");
+    }
+
+    #[test]
+    fn turning_the_automatic_scan_on_scans_at_once() {
+        // The setting covers the scan at startup and the one on a timer, so
+        // waiting a minute for either would look as though it did nothing.
+        let mut app = app_with(&[("One", &["A"])]);
+        app.config.music_directory = Some(std::env::temp_dir());
+
+        app.set_auto_scan(true);
+
+        assert!(app.scan.is_some(), "a scan starts with the setting");
     }
 
     #[test]

@@ -46,6 +46,10 @@ pub struct Config {
     /// Whether files and directories whose name starts with a dot are left
     /// out of the scan.
     pub ignore_hidden: Option<bool>,
+    /// Whether the music directory is scanned at startup and again while the
+    /// window runs, so a file added outside the window shows up without a
+    /// rescan by hand.
+    pub auto_scan: Option<bool>,
     /// Whether the album art is fitted into its square whole, rather than
     /// cropped to fill it.
     pub cover_fit: Option<bool>,
@@ -145,6 +149,7 @@ mod tests {
             file_extension: Some(false),
             background: Some(true),
             ignore_hidden: Some(false),
+            auto_scan: Some(false),
             cover_fit: Some(true),
             preview: Some(false),
         };
@@ -169,6 +174,7 @@ mod tests {
             Some([true, true, false, false, true, true])
         );
         assert_eq!(loaded.file_extension, Some(false));
+        assert_eq!(loaded.auto_scan, Some(false));
         assert_eq!(loaded.background, Some(true));
         assert_eq!(loaded.ignore_hidden, Some(false));
         assert_eq!(loaded.cover_fit, Some(true));

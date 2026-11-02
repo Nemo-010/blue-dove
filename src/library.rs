@@ -12,7 +12,24 @@ use std::thread;
 use std::time::Duration;
 
 use lofty::prelude::*;
+use unicode_normalization::UnicodeNormalization;
 use walkdir::WalkDir;
+
+/// `text` in the composed form the window's faces can draw.
+///
+/// A tag or a file name may spell a letter as a base and a mark on top: `z`
+/// followed by a combining caron, which is how a tool that does not compose
+/// its text leaves it. The faces the window bundles hold precomposed letters
+/// only and cannot place a mark, so that pair draws as the letter and a box.
+/// Composing the two first turns it into U+017E, which they draw. Text that is
+/// already composed comes back unchanged, and the scripts with no precomposed
+/// form at all are left for a fallback font to draw.
+pub(crate) fn composed(text: &str) -> String {
+    if text.is_ascii() {
+        return text.to_owned();
+    }
+    text.nfc().collect()
+}
 
 /// File extensions the player reads.
 ///
@@ -60,7 +77,7 @@ const IMAGE_EXTENSIONS: &[&str] = &["jpg", "jpeg", "png", "svg"];
 const PROGRESS_EVERY: usize = 200;
 
 /// One playable file and the tags read from it.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Track {
     /// Where the file lives.
     pub path: PathBuf,
@@ -114,12 +131,12 @@ impl Track {
             return self.title.clone();
         };
         if extension {
-            return name.to_string_lossy().into_owned();
+            return composed(&name.to_string_lossy());
         }
         self.path
             .file_stem()
-            .map(|stem| stem.to_string_lossy().into_owned())
-            .unwrap_or_else(|| name.to_string_lossy().into_owned())
+            .map(|stem| composed(&stem.to_string_lossy()))
+            .unwrap_or_else(|| composed(&name.to_string_lossy()))
     }
 }
 
@@ -228,6 +245,17 @@ impl Library {
     /// Whether the scan found nothing.
     pub fn is_empty(&self) -> bool {
         self.tracks.is_empty()
+    }
+
+    /// Whether `other` lists the files this one lists, with the same tags.
+    ///
+    /// A scan that found nothing new answers a library of the same tracks,
+    /// which the window has no reason to take in: taking one in rebuilds
+    /// every track, forms the albums again and writes the session file. The
+    /// albums are left out of the comparison because they are grouped and
+    /// sorted from the tracks, so the same tracks form the same albums.
+    pub fn same_as(&self, other: &Self) -> bool {
+        self.tracks == other.tracks
     }
 
     /// The directory at `path`, looked up through the tree.
@@ -422,7 +450,7 @@ fn place(directory: &mut Directory, path: &Path, add: impl FnOnce(&mut Directory
         add(directory);
         return;
     };
-    let name = first.as_os_str().to_string_lossy().to_string();
+    let name = composed(&first.as_os_str().to_string_lossy());
     let position = match directory
         .children
         .iter()
@@ -535,6 +563,9 @@ fn read_library_with(
     let mut tracks = Vec::new();
     let mut covers = Covers::default();
     let mut seen = 0;
+    // Files read from disk rather than from the cache, which is what says
+    // whether the cache on disk needs writing again.
+    let mut read = 0;
     let walk = WalkDir::new(root)
         .follow_links(true)
         .into_iter()
@@ -552,18 +583,32 @@ fn read_library_with(
         if let Some(track) = cached_track(&cache, entry.path(), &mut covers) {
             tracks.push(track);
         } else if let Some(track) = read_track(entry.path(), root, &mut covers) {
+            read += 1;
             tracks.push(track);
         }
     }
     progress(seen);
 
     let library = Library::from_tracks(tracks);
+    // A scan of a library nothing touched reads every entry from the cache and
+    // finds the files it lists, so the cache on disk already says what this
+    // scan would write. Skipping the write is what makes the scan the window
+    // runs every minute cost a `stat` per file rather than a rewrite of a file
+    // that can be megabytes. A file added, removed, renamed or retagged, and
+    // any picture stored again, shows up as a difference here.
+    let unchanged = read == 0
+        && !covers.failed
+        && cache
+            .as_ref()
+            .is_some_and(|cache| cache.all().len() == library.tracks.len());
     // A failed write only costs the next start its speed, so it is reported
     // and not treated as a failed scan. A write that failed while storing a
     // picture is skipped for the same reason, and because the entry would
     // record art that is not in the cache: the next start reads it again.
     let written = if covers.failed {
         Err("cannot store album art in the cache".to_string())
+    } else if unchanged {
+        Ok(())
     } else {
         crate::cache::save(&library, root)
     };
@@ -661,18 +706,20 @@ fn read_track(path: &Path, root: &Path, covers: &mut Covers) -> Option<Track> {
         .and_then(|stem| stem.to_str())
         .unwrap_or("Untitled")
         .to_string();
+    let stem = composed(&stem);
     let directory = path
         .parent()
         .and_then(|parent| parent.file_name())
         .and_then(|name| name.to_str())
         .unwrap_or("Unknown Album")
         .to_string();
+    let directory = composed(&directory);
 
     let text = |key: ItemKey| {
         tag.and_then(|tag| tag.get_string(key))
             .map(str::trim)
             .filter(|value| !value.is_empty())
-            .map(str::to_string)
+            .map(composed)
     };
 
     let artist = text(ItemKey::TrackArtist).unwrap_or_else(|| "Unknown Artist".to_string());
@@ -939,6 +986,86 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn a_scan_of_an_untouched_library_leaves_the_cache_as_it_is() {
+        // The scan the window runs every minute is worth running only if an
+        // untouched library costs a stat per file: writing a cache that says
+        // what it already says would rewrite a file of megabytes a minute.
+        let directory = Scratch::new("quiet-cache", 2);
+        read_library(&directory.0).expect("the directory scans");
+        let path = crate::cache::cache_path(&directory.0).expect("the cache is kept somewhere");
+        let marker = format!(
+            "{}\n# left by the first scan\n",
+            std::fs::read_to_string(&path).expect("the cache reads")
+        );
+        std::fs::write(&path, &marker).expect("the marker is written");
+
+        read_library(&directory.0).expect("the directory scans again");
+
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("the cache reads"),
+            marker,
+            "nothing changed, so the cache is left alone"
+        );
+    }
+
+    #[test]
+    fn a_scan_that_reads_a_file_writes_the_cache_again() {
+        let directory = Scratch::new("dirty-cache", 2);
+        read_library(&directory.0).expect("the directory scans");
+        let path = crate::cache::cache_path(&directory.0).expect("the cache is kept somewhere");
+        let marker = format!(
+            "{}\n# left by the first scan\n",
+            std::fs::read_to_string(&path).expect("the cache reads")
+        );
+        std::fs::write(&path, &marker).expect("the marker is written");
+        let added = directory.0.join("An Album").join("99.wav");
+        std::fs::File::create(&added)
+            .and_then(|mut file| file.write_all(&wav(1)))
+            .expect("the file is written");
+
+        read_library(&directory.0).expect("the directory scans again");
+
+        let written = std::fs::read_to_string(&path).expect("the cache reads");
+        assert!(
+            !written.contains("# left by the first scan"),
+            "a new file is in the cache, so the cache is written again"
+        );
+        assert!(written.contains("99"), "and the new file is in it");
+    }
+
+    #[test]
+    fn a_letter_written_as_base_and_mark_is_composed() {
+        // A tool written on macOS leaves the accent as a mark after the
+        // letter, and the faces the window bundles cannot place a mark: the
+        // pair draws as the letter and a box. Composing it first draws U+017E.
+        assert_eq!(composed("z\u{30C}"), "\u{17E}");
+        assert_eq!(composed("Z\u{30C}"), "\u{17D}");
+        assert_eq!(composed("e\u{301}"), "\u{E9}");
+        assert_eq!(
+            composed("\u{17E}"),
+            "\u{17E}",
+            "a composed letter is unchanged"
+        );
+        assert_eq!(composed("Song"), "Song", "plain text is unchanged");
+    }
+
+    #[test]
+    fn a_file_named_with_a_mark_is_listed_composed() {
+        // The file name is the title when the tags name none, so the mark has
+        // to be composed there too, not only in text read from a tag.
+        let directory = Scratch::empty("composed-name");
+        let album = directory.0.join("An Album");
+        std::fs::create_dir_all(&album).expect("the directory is made");
+        let path = album.join("z\u{30C}.wav");
+        std::fs::File::create(&path)
+            .and_then(|mut file| file.write_all(&wav(1)))
+            .expect("the file is written");
+
+        let track = read_one(&path).expect("the file is read");
+        assert_eq!(track.title, "\u{17E}", "the name is composed, so it draws");
     }
 
     #[test]
