@@ -1,4 +1,10 @@
 
+## [0.1.13](https://github.com/pkgforge-apps/blue-dove/compare/v0.1.12...v0.1.13) - 2026-11-02
+
+### Bug Fixes
+
+- Fonts, cover resolution, MPRIS in preview, and the library scan (#43, #44, #45, #46) ([#47](https://github.com/pkgforge-apps/blue-dove/pull/47)) - ([e3bb9d2](https://github.com/pkgforge-apps/blue-dove/commit/e3bb9d20c523785cb9068cbdc2a4480a286a9aaa))
+
 ## [0.1.12](https://github.com/pkgforge-apps/blue-dove/compare/v0.1.11...v0.1.12) - 2026-11-01
 
 ### Performance

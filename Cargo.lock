@@ -338,7 +338,7 @@ dependencies = [
 
 [[package]]
 name = "blue-dove"
-version = "0.1.12"
+version = "0.1.13"
 dependencies = [
  "ape-decoder",
  "dirs",
