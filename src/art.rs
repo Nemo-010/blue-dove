@@ -175,8 +175,11 @@ impl Art {
     ///
     /// The thread remembers what it has decoded too. Leaving a key there while
     /// dropping it here would swallow the next ask for it, which is what a
-    /// picture evicted for room and asked for again runs into.
-    fn forget(&mut self, keys: &[String]) {
+    /// picture evicted for room and asked for again runs into. The window
+    /// calls this on its own for a picture it uploaded at a size of its own:
+    /// that one is a few megabytes, and the texture it became is all the
+    /// window needs.
+    pub fn forget(&mut self, keys: &[String]) {
         for key in keys {
             self.decoded.remove(key);
             self.asked.remove(key);
@@ -278,7 +281,33 @@ fn decode(key: String, done: &mut HashSet<String>, sender: &Sender<(String, Opti
 /// The media widget names a track's art by a file, so it needs the pixels at
 /// once rather than a frame later, and a track is played once at a time.
 pub fn decode_now(key: &str) -> Option<Cover> {
-    crate::cache::read_cover(key).and_then(|bytes| crate::cover::decode(&bytes))
+    let (key, size) = split(key);
+    let bytes = crate::cache::read_cover(key)?;
+    match size {
+        Some(size) => crate::cover::decode_at(&bytes, size),
+        None => crate::cover::decode(&bytes),
+    }
+}
+
+/// The key a picture is stored under, and the size it was asked for.
+///
+/// A cover the window draws large is stored under its key with the size after
+/// it, `0123456789abcdef-2a1@640`, so the same picture can be decoded at
+/// thumbnail size for the album lists and at the size of the big square for
+/// the track that plays without the two answering for each other.
+const SIZE_MARK: char = '@';
+
+/// The stored key and the size asked for, which a plain key does not name.
+fn split(key: &str) -> (&str, Option<u32>) {
+    match key.split_once(SIZE_MARK) {
+        Some((key, size)) => (key, size.parse().ok()),
+        None => (key, None),
+    }
+}
+
+/// The key that asks for the picture `key` at `size` pixels.
+pub fn sized_key(key: &str, size: u32) -> String {
+    format!("{key}{SIZE_MARK}{size}")
 }
 
 #[cfg(test)]
@@ -307,6 +336,33 @@ mod tests {
         };
         let bytes = crate::cover::to_png(&cover).expect("the picture encodes");
         crate::cache::store_cover(&bytes).expect("the picture is stored")
+    }
+
+    #[test]
+    fn a_key_that_names_a_size_is_decoded_at_it() {
+        // The square above the controls draws a cover wider than a list row,
+        // so it asks for the same picture at a size of its own instead of
+        // stretching the thumbnail the lists use.
+        let cover = Cover {
+            width: 800,
+            height: 800,
+            rgba: [30, 60, 90, 255].repeat(800 * 800),
+        };
+        let bytes = crate::cover::to_png(&cover).expect("the picture encodes");
+        let key = crate::cache::store_cover(&bytes).expect("the picture is stored");
+
+        let thumbnail = decode_now(&key).expect("the thumbnail decodes");
+        assert_eq!(
+            (thumbnail.width, thumbnail.height),
+            (256, 256),
+            "a plain key is a thumbnail"
+        );
+        let large = decode_now(&sized_key(&key, 640)).expect("the big picture decodes");
+        assert_eq!(
+            (large.width, large.height),
+            (640, 640),
+            "a key naming a size decodes at that size"
+        );
     }
 
     #[test]

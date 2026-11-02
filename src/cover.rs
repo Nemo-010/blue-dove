@@ -7,8 +7,32 @@ use zune_jpeg::JpegDecoder;
 use zune_jpeg::zune_core::colorspace::ColorSpace;
 use zune_jpeg::zune_core::options::DecoderOptions;
 
-/// Longest side of a decoded cover, in pixels.
-const SIZE: u32 = 256;
+/// Longest side of a decoded thumbnail, in pixels.
+///
+/// The album lists draw covers the size of a row, so this is all the detail
+/// they can show. The big square above the controls is several times wider and
+/// is decoded at its own size; see [`decoded_size`].
+pub const THUMBNAIL: u32 = 256;
+
+/// Sides a cover drawn large is decoded at, in pixels, smallest first.
+///
+/// The square above the controls is as wide as the window and scaled by the
+/// screen's own factor, so a thumbnail stretched over it reads blurry. The
+/// picture is decoded again at the size it is drawn, rounded up to one of
+/// these: a window dragged by a pixel must not decode the picture again, and
+/// the steps are fine enough that it is never stretched far.
+const SIZES: &[u32] = &[THUMBNAIL, 320, 448, 640, 896, 1280];
+
+/// The size a cover is decoded at to fill `pixels` of screen without being
+/// stretched.
+pub fn decoded_size(pixels: u32) -> u32 {
+    let last = SIZES[SIZES.len() - 1];
+    SIZES
+        .iter()
+        .copied()
+        .find(|&size| size >= pixels)
+        .unwrap_or(last)
+}
 
 /// A decoded cover image.
 #[derive(Clone, Debug)]
@@ -42,18 +66,25 @@ pub fn to_png(cover: &Cover) -> Option<Vec<u8>> {
 /// Decodes a cover from the bytes of a JPEG, PNG or SVG file.
 ///
 /// Returns `None` for any other format and for anything malformed, which lets
-/// the window draw its placeholder instead of failing over a bad tag.
+/// the window draw its placeholder instead of failing over a bad tag. The
+/// picture comes back no larger than [`THUMBNAIL`]; a caller drawing it
+/// larger asks for a size of its own with [`decode_at`].
 pub fn decode(bytes: &[u8]) -> Option<Cover> {
+    decode_at(bytes, THUMBNAIL)
+}
+
+/// Decodes a cover, scaled so its longer side is at most `size` pixels.
+pub fn decode_at(bytes: &[u8], size: u32) -> Option<Cover> {
     let image = if bytes.starts_with(&[0xff, 0xd8, 0xff]) {
         jpeg(bytes)?
     } else if bytes.starts_with(b"\x89PNG") {
         png(bytes)?
     } else if looks_like_svg(bytes) {
-        svg(bytes)?
+        svg(bytes, size)?
     } else {
         return None;
     };
-    Some(shrink(image))
+    Some(shrink(image, size))
 }
 
 /// An image in straight RGBA, before scaling.
@@ -125,12 +156,12 @@ fn png(bytes: &[u8]) -> Option<Image> {
 }
 
 /// Renders an SVG at the size the window shows it at.
-fn svg(bytes: &[u8]) -> Option<Image> {
+fn svg(bytes: &[u8], size: u32) -> Option<Image> {
     let tree = resvg::usvg::Tree::from_data(bytes, &resvg::usvg::Options::default()).ok()?;
-    let size = tree.size();
-    let scale = (SIZE as f32 / size.width().max(size.height())).min(1.0);
-    let width = (size.width() * scale).round().max(1.0) as u32;
-    let height = (size.height() * scale).round().max(1.0) as u32;
+    let extent = tree.size();
+    let scale = (size as f32 / extent.width().max(extent.height())).min(1.0);
+    let width = (extent.width() * scale).round().max(1.0) as u32;
+    let height = (extent.height() * scale).round().max(1.0) as u32;
     let mut pixmap = resvg::tiny_skia::Pixmap::new(width, height)?;
     resvg::render(
         &tree,
@@ -158,19 +189,19 @@ fn looks_like_svg(bytes: &[u8]) -> bool {
     head.windows(4).any(|window| window == b"<svg")
 }
 
-/// Scales the image down so its longer side is at most [`SIZE`].
+/// Scales the image down so its longer side is at most `size`.
 ///
 /// The window crops covers to a square, so the aspect ratio is kept and the
 /// shrink averages the source pixels each one lands on.
-fn shrink(image: Image) -> Cover {
-    if image.width <= SIZE && image.height <= SIZE {
+fn shrink(image: Image, size: u32) -> Cover {
+    if image.width <= size && image.height <= size {
         return Cover {
             width: image.width as usize,
             height: image.height as usize,
             rgba: image.rgba,
         };
     }
-    let scale = f64::from(SIZE) / f64::from(image.width.max(image.height));
+    let scale = f64::from(size) / f64::from(image.width.max(image.height));
     let width = ((f64::from(image.width) * scale).round() as u32).max(1);
     let height = ((f64::from(image.height) * scale).round() as u32).max(1);
 
@@ -247,32 +278,68 @@ mod tests {
 
     #[test]
     fn a_small_image_is_left_alone() {
-        let cover = shrink(Image {
-            width: 2,
-            height: 1,
-            rgba: vec![0; 8],
-        });
+        let cover = shrink(
+            Image {
+                width: 2,
+                height: 1,
+                rgba: vec![0; 8],
+            },
+            THUMBNAIL,
+        );
         assert_eq!((cover.width, cover.height), (2, 1));
     }
 
     #[test]
     fn a_large_image_keeps_its_aspect_ratio() {
-        let cover = shrink(Image {
-            width: 1000,
-            height: 500,
-            rgba: vec![0; 1000 * 500 * 4],
-        });
+        let cover = shrink(
+            Image {
+                width: 1000,
+                height: 500,
+                rgba: vec![0; 1000 * 500 * 4],
+            },
+            THUMBNAIL,
+        );
         assert_eq!((cover.width, cover.height), (256, 128));
         assert_eq!(cover.rgba.len(), 256 * 128 * 4);
     }
 
     #[test]
+    fn a_picture_drawn_large_keeps_the_detail_the_window_has_room_for() {
+        // The square above the controls is drawn as wide as the window, so a
+        // thumbnail stretched over it reads blurry: the picture is decoded at
+        // the size it is drawn instead.
+        let cover = shrink(
+            Image {
+                width: 1400,
+                height: 1400,
+                rgba: vec![0; 1400 * 1400 * 4],
+            },
+            decoded_size(640),
+        );
+        assert_eq!((cover.width, cover.height), (640, 640));
+        assert!(cover.width > THUMBNAIL as usize, "more than a thumbnail");
+    }
+
+    #[test]
+    fn a_size_is_rounded_up_to_the_next_step() {
+        // A window dragged by a pixel must not decode the picture again.
+        assert_eq!(decoded_size(0), THUMBNAIL);
+        assert_eq!(decoded_size(300), 320);
+        assert_eq!(decoded_size(320), 320);
+        assert_eq!(decoded_size(321), 448);
+        assert_eq!(decoded_size(5000), *SIZES.last().unwrap());
+    }
+
+    #[test]
     fn a_flat_colour_survives_the_shrink() {
-        let cover = shrink(Image {
-            width: 8,
-            height: 2,
-            rgba: [10, 20, 30, 255].repeat(16),
-        });
+        let cover = shrink(
+            Image {
+                width: 8,
+                height: 2,
+                rgba: [10, 20, 30, 255].repeat(16),
+            },
+            THUMBNAIL,
+        );
         assert_eq!(cover.rgba[..4], [10, 20, 30, 255]);
     }
 
