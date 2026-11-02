@@ -12,7 +12,24 @@ use std::thread;
 use std::time::Duration;
 
 use lofty::prelude::*;
+use unicode_normalization::UnicodeNormalization;
 use walkdir::WalkDir;
+
+/// `text` in the composed form the window's faces can draw.
+///
+/// A tag or a file name may spell a letter as a base and a mark on top: `z`
+/// followed by a combining caron, which is how a tool that does not compose
+/// its text leaves it. The faces the window bundles hold precomposed letters
+/// only and cannot place a mark, so that pair draws as the letter and a box.
+/// Composing the two first turns it into U+017E, which they draw. Text that is
+/// already composed comes back unchanged, and the scripts with no precomposed
+/// form at all are left for a fallback font to draw.
+pub(crate) fn composed(text: &str) -> String {
+    if text.is_ascii() {
+        return text.to_owned();
+    }
+    text.nfc().collect()
+}
 
 /// File extensions the player reads.
 ///
@@ -114,12 +131,12 @@ impl Track {
             return self.title.clone();
         };
         if extension {
-            return name.to_string_lossy().into_owned();
+            return composed(&name.to_string_lossy());
         }
         self.path
             .file_stem()
-            .map(|stem| stem.to_string_lossy().into_owned())
-            .unwrap_or_else(|| name.to_string_lossy().into_owned())
+            .map(|stem| composed(&stem.to_string_lossy()))
+            .unwrap_or_else(|| composed(&name.to_string_lossy()))
     }
 }
 
@@ -422,7 +439,7 @@ fn place(directory: &mut Directory, path: &Path, add: impl FnOnce(&mut Directory
         add(directory);
         return;
     };
-    let name = first.as_os_str().to_string_lossy().to_string();
+    let name = composed(&first.as_os_str().to_string_lossy());
     let position = match directory
         .children
         .iter()
@@ -661,18 +678,20 @@ fn read_track(path: &Path, root: &Path, covers: &mut Covers) -> Option<Track> {
         .and_then(|stem| stem.to_str())
         .unwrap_or("Untitled")
         .to_string();
+    let stem = composed(&stem);
     let directory = path
         .parent()
         .and_then(|parent| parent.file_name())
         .and_then(|name| name.to_str())
         .unwrap_or("Unknown Album")
         .to_string();
+    let directory = composed(&directory);
 
     let text = |key: ItemKey| {
         tag.and_then(|tag| tag.get_string(key))
             .map(str::trim)
             .filter(|value| !value.is_empty())
-            .map(str::to_string)
+            .map(composed)
     };
 
     let artist = text(ItemKey::TrackArtist).unwrap_or_else(|| "Unknown Artist".to_string());
@@ -939,6 +958,38 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn a_letter_written_as_base_and_mark_is_composed() {
+        // A tool written on macOS leaves the accent as a mark after the
+        // letter, and the faces the window bundles cannot place a mark: the
+        // pair draws as the letter and a box. Composing it first draws U+017E.
+        assert_eq!(composed("z\u{30C}"), "\u{17E}");
+        assert_eq!(composed("Z\u{30C}"), "\u{17D}");
+        assert_eq!(composed("e\u{301}"), "\u{E9}");
+        assert_eq!(
+            composed("\u{17E}"),
+            "\u{17E}",
+            "a composed letter is unchanged"
+        );
+        assert_eq!(composed("Song"), "Song", "plain text is unchanged");
+    }
+
+    #[test]
+    fn a_file_named_with_a_mark_is_listed_composed() {
+        // The file name is the title when the tags name none, so the mark has
+        // to be composed there too, not only in text read from a tag.
+        let directory = Scratch::empty("composed-name");
+        let album = directory.0.join("An Album");
+        std::fs::create_dir_all(&album).expect("the directory is made");
+        let path = album.join("z\u{30C}.wav");
+        std::fs::File::create(&path)
+            .and_then(|mut file| file.write_all(&wav(1)))
+            .expect("the file is written");
+
+        let track = read_one(&path).expect("the file is read");
+        assert_eq!(track.title, "\u{17E}", "the name is composed, so it draws");
     }
 
     #[test]

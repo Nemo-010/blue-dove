@@ -32,6 +32,7 @@ rodio = { version = "0.23.0", default-features = false, features = ["flac", "mp3
 rvoip-codec-core = { version = "0.4.0", default-features = false, features = ["amr"] }
 serde = { version = "1.0.229", features = ["derive"] }
 toml = "1.1.8"
+unicode-normalization = "0.1.26"
 walkdir = "2.5.0"
 wavicle = "0.1.0"
 zbus = "5"
