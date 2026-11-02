@@ -1,6 +1,6 @@
 [package]
 name = "blue-dove"
-version = "0.1.13"
+version = "0.1.14"
 edition = "2024"
 description = "A fast music player with an album browser and waveform seekbar"
 license = "MIT"

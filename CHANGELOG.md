@@ -1,4 +1,10 @@
 
+## [0.1.14](https://github.com/pkgforge-apps/blue-dove/compare/v0.1.13...v0.1.14) - 2026-11-02
+
+### Bug Fixes
+
+- *(watch)* Stop the watcher counting a scan's own reads ([#50](https://github.com/pkgforge-apps/blue-dove/pull/50)) - ([a69344e](https://github.com/pkgforge-apps/blue-dove/commit/a69344e14d2078c02b0c81641433e4091c25b1d0))
+
 ## [0.1.13](https://github.com/pkgforge-apps/blue-dove/compare/v0.1.12...v0.1.13) - 2026-11-02
 
 ### Bug Fixes
