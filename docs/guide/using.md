@@ -29,6 +29,10 @@ hour after the last scan instead, and so is a directory with more
 subdirectories than the kernel keeps watches for. Both still work, they just
 notice later.
 
+Reading is not a change: a player, an indexer or a backup reading the library
+does not make it scan again. Only a file or directory that appears, goes,
+is renamed, written or retagged does.
+
 ## Find an album
 
 The menu bar and the library share the left-hand column: the menus sit

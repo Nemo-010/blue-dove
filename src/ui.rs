@@ -669,7 +669,7 @@ impl App {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     // The scan is the only status the library column has
                     // room for; the track count lives in the library header.
-                    if let Some((_, seen)) = &self.scan {
+                    if let Some(seen) = self.scan_progress() {
                         ui.label(
                             egui::RichText::new(format!("{seen} files"))
                                 .color(ui.visuals().weak_text_color()),

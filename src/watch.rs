@@ -15,15 +15,15 @@
 //! Events arrive on a thread of notify's own, one per file of a copy, so the
 //! window is only woken: it coalesces them into one scan once they stop.
 
-use std::cell::Cell;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver};
-use std::time::{Duration, Instant};
+use std::thread;
+use std::time::Duration;
 
-use notify::event::{EventKind, ModifyKind, RemoveKind};
-use notify::{RecommendedWatcher, RecursiveMode, Watcher as _};
+use notify::event::{AccessKind, AccessMode, EventKind, ModifyKind, RemoveKind};
+use notify::{ErrorKind, RecommendedWatcher, RecursiveMode, Watcher as _};
 
 /// How often the directory is looked for when nothing else says it went.
 ///
@@ -31,8 +31,8 @@ use notify::{RecommendedWatcher, RecursiveMode, Watcher as _};
 /// the path the window named: Windows answers a deleted directory by dropping
 /// the watch without a word to the handler, and FSEvents names the path the
 /// kernel resolved, which a symbolic link in the path does not match. Asking
-/// the filesystem covers both, and one `stat` a second on the directory the
-/// library lives in costs nothing beside the scan that follows it.
+/// the filesystem covers both, on a thread of its own so that a mount which
+/// stopped answering cannot hold a frame.
 const CHECK_EVERY: Duration = Duration::from_secs(1);
 
 /// Called after an event, so the window draws and takes it in.
@@ -52,9 +52,9 @@ pub struct Watch {
     /// it, and nothing under that path is reported again: the window has to
     /// place a new one, and this is how it learns to.
     ended: Arc<AtomicBool>,
-    /// When the directory was last looked for, so that it is not on every
-    /// frame.
-    looked: Cell<Instant>,
+    /// Set when the watch is dropped, so the thread looking for the directory
+    /// ends with it rather than one a second for the life of the window.
+    stop: Arc<AtomicBool>,
 }
 
 impl Watch {
@@ -63,26 +63,12 @@ impl Watch {
     /// What the backend reported is taken first, and the directory itself is
     /// looked for once a second for the backends that report nothing.
     pub fn ended(&self) -> bool {
-        if self.ended.load(Ordering::Relaxed) {
-            return true;
-        }
-        let now = Instant::now();
-        if now.saturating_duration_since(self.looked.get()) < CHECK_EVERY {
-            return false;
-        }
-        self.looked.set(now);
-        // An error is not the directory going away: a permission that comes
-        // and goes still leaves it there to report changes under.
-        if !matches!(self.root.try_exists(), Ok(false)) {
-            return false;
-        }
-        self.ended.store(true, Ordering::Relaxed);
-        true
+        self.ended.load(Ordering::Relaxed)
     }
     /// Whether anything under the directory changed since the last call.
     ///
-    /// Every event the platform reported counts as one, since they are all
-    /// the same thing here: a reason to scan once they stop.
+    /// Only the events that mean a change reach here: a read of the library
+    /// wakes nothing, so a scan of it does not ask for another.
     pub fn changed(&self) -> bool {
         let mut changed = false;
         while self.events.try_recv().is_ok() {
@@ -97,21 +83,49 @@ impl Watch {
     }
 }
 
+impl Drop for Watch {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+    }
+}
+
+/// Whether the directory is gone, taking the watch with it.
+///
+/// A stat rather than an event, because the event is not to be had
+/// everywhere; an error is not the directory going away either, since a
+/// permission that comes and goes still leaves it there to report changes
+/// under.
+fn looked_for(root: &Path, ended: &AtomicBool) -> bool {
+    if ended.load(Ordering::Relaxed) {
+        return true;
+    }
+    if !matches!(root.try_exists(), Ok(false)) {
+        return false;
+    }
+    ended.store(true, Ordering::Relaxed);
+    true
+}
+
 /// Watches `directory` and everything under it, waking the window on a change.
 ///
-/// Answers `None` when the directory cannot be watched: a tree with more
-/// directories than the kernel keeps watches for, or a storage driver that
-/// cannot report changes. The fallback scan then carries the library on its
-/// own, which is what makes this worth failing quietly rather than refusing
-/// to open the window.
+/// Answers `None` when the directory cannot be watched at all: no backend for
+/// it, or no watches left for it. A tree with more directories than the kernel
+/// keeps watches for is not that: it is watched as far as the watches go, the
+/// rest is left to the fallback scan, and the window is never asked to place
+/// one watch per frame for it.
 pub fn spawn(directory: &Path, wake: Waker) -> Option<Watch> {
     let (sender, events) = mpsc::channel();
     let ended = Arc::new(AtomicBool::new(false));
     let ended_by_event = Arc::clone(&ended);
+    let stop = Arc::new(AtomicBool::new(false));
     let root = directory.to_path_buf();
     let resolved = root.canonicalize().unwrap_or_else(|_| root.clone());
     let watched = root.clone();
     let watched_resolved = resolved.clone();
+    let wake_on_event = Arc::clone(&wake);
+    // The tree is walked again from the top by a watch placed here, so a
+    // reason to place one every frame is a reason not to watch at all: what
+    // reports is kept, and the fallback scan carries what does not.
     let mut watcher = notify::recommended_watcher(move |result: notify::Result<notify::Event>| {
         match result {
             // The directory itself going away ends the watch, and the kernel
@@ -119,34 +133,53 @@ pub fn spawn(directory: &Path, wake: Waker) -> Option<Watch> {
             Ok(event) if ends_the_watch(&event, &watched, &watched_resolved) => {
                 ended_by_event.store(true, Ordering::Relaxed);
                 if sender.send(()).is_ok() {
-                    wake();
+                    wake_on_event();
                 }
             }
+            // Reading the library is not a change to it, and a scan is nothing
+            // but reads.
+            Ok(event) if !changes_the_library(&event) => {}
             Ok(_) => {
                 if sender.send(()).is_ok() {
-                    wake();
+                    wake_on_event();
                 }
             }
-            // A backend that could not watch something answers with an error
-            // rather than an event, which leaves nothing for the window to
-            // take in: the file it could not see arrives with the next full
-            // scan, and the watch is placed again.
+            // The kernel has no watches left for a tree this large. What is
+            // watched is still reported and the rest arrives with the
+            // fallback scan, which is what the hourly one is for.
+            Err(error) if matches!(error.kind, ErrorKind::MaxFilesWatch) => {}
+            // Anything else is a read that failed: the files it could not see
+            // arrive with a full scan, so that is what it asks for.
             Err(_) => {
-                ended_by_event.store(true, Ordering::Relaxed);
                 if sender.send(()).is_ok() {
-                    wake();
+                    wake_on_event();
                 }
             }
         }
     })
     .ok()?;
     watcher.watch(directory, RecursiveMode::Recursive).ok()?;
+    let look_root = root.clone();
+    let look_ended = Arc::clone(&ended);
+    let look_stop = Arc::clone(&stop);
+    let look_wake = Arc::clone(&wake);
+    let _ = thread::Builder::new()
+        .name("blue-dove watch look".to_string())
+        .spawn(move || {
+            while !look_stop.load(Ordering::Relaxed) {
+                thread::sleep(CHECK_EVERY);
+                if looked_for(&look_root, &look_ended) {
+                    look_wake();
+                    return;
+                }
+            }
+        });
     Some(Watch {
         root,
         _watcher: watcher,
         events,
         ended,
-        looked: Cell::new(Instant::now()),
+        stop,
     })
 }
 
@@ -165,6 +198,29 @@ fn ends_the_watch(event: &notify::Event, root: &Path, resolved: &Path) -> bool {
         .paths
         .iter()
         .any(|path| path == root || path == resolved)
+}
+
+/// Whether `event` says the library changed, rather than that it was read.
+///
+/// A scan opens every directory it walks and every file whose tags it reads,
+/// and the backends report some of that as events of their own: inotify hands
+/// over an open, and Windows calls a directory that was only read modified.
+/// Counting those would have every scan ask for the next one five seconds
+/// later, for ever, with nothing changing.
+///
+/// A file closed after a write is a change, and so is a file whose metadata
+/// moved, since a retag is a write. A directory that is only touched is not:
+/// what changes inside it arrives named after the file or directory that
+/// appeared, went or was renamed.
+fn changes_the_library(event: &notify::Event) -> bool {
+    match event.kind {
+        EventKind::Access(AccessKind::Close(AccessMode::Write)) => true,
+        EventKind::Access(_) => false,
+        EventKind::Modify(ModifyKind::Any | ModifyKind::Metadata(_)) => {
+            event.paths.iter().any(|path| !path.is_dir())
+        }
+        _ => true,
+    }
 }
 
 #[cfg(test)]
@@ -201,6 +257,21 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         false
+    }
+
+    /// Waits until nothing has been reported for a while.
+    ///
+    /// One write is more than one event, and the platform may hand them over in
+    /// batches a moment apart: a test that counts what arrives after a change
+    /// has to let the change finish.
+    fn quiet(watch: &Watch) {
+        let mut last = Instant::now();
+        while last.elapsed() < Duration::from_millis(300) {
+            if watch.changed() {
+                last = Instant::now();
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
 
     #[test]
@@ -289,25 +360,95 @@ mod tests {
     fn a_directory_that_is_gone_ends_the_watch_unasked() {
         // Windows ends the watch on a directory that is deleted without a
         // word to the handler, so nothing arrives to say so: the directory is
-        // looked for instead, which is what this places no watch around.
+        // looked for instead. What the filesystem answers is what is tested
+        // here, a second apart on a thread of its own in `spawn`.
         let scratch = Scratch::new("gone");
-        let (_, events) = mpsc::channel();
-        let watch = Watch {
-            root: scratch.0.clone(),
-            _watcher: notify::recommended_watcher(|_| {}).expect("a watcher is made"),
-            events,
-            ended: Arc::new(AtomicBool::new(false)),
-            looked: Cell::new(Instant::now()),
-        };
-        assert!(!watch.ended(), "the directory is there to begin with");
+        let ended = AtomicBool::new(false);
+        assert!(!looked_for(&scratch.0, &ended), "the directory is there");
 
         std::fs::remove_dir_all(&scratch.0).expect("the directory goes");
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while !watch.ended() && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(10));
+
+        assert!(looked_for(&scratch.0, &ended), "and is found gone");
+        assert!(
+            ended.load(Ordering::Relaxed),
+            "which the watch remembers without asking again"
+        );
+    }
+
+    #[test]
+    fn reading_the_library_is_not_a_change() {
+        // A scan opens every directory it walks and every file whose tags it
+        // reads, and inotify hands those opens over as events: counting them
+        // has every scan ask for the next one, five seconds later, for ever.
+        let scratch = Scratch::new("changing");
+        let path = scratch.0.join("song.wav");
+        std::fs::write(&path, b"not really audio").expect("the file is written");
+        let album = scratch.0.join("An Album");
+        std::fs::create_dir_all(&album).expect("the album directory is made");
+        let opened = notify::Event::new(EventKind::Access(AccessKind::Open(AccessMode::Any)))
+            .add_path(path.clone());
+        let written = notify::Event::new(EventKind::Access(AccessKind::Close(AccessMode::Write)))
+            .add_path(path.clone());
+        let retagged = notify::Event::new(EventKind::Modify(ModifyKind::Metadata(
+            notify::event::MetadataKind::Any,
+        )))
+        .add_path(path.clone());
+        let created =
+            notify::Event::new(EventKind::Create(notify::event::CreateKind::File)).add_path(path);
+        let touched_directory =
+            notify::Event::new(EventKind::Modify(ModifyKind::Any)).add_path(album.clone());
+
+        assert!(!changes_the_library(&opened), "an open is a read");
+        assert!(
+            changes_the_library(&written),
+            "a file closed after a write changed"
+        );
+        assert!(changes_the_library(&retagged), "a retag changed the tags");
+        assert!(changes_the_library(&created), "a new file is a change");
+        assert!(
+            !changes_the_library(&touched_directory),
+            "a directory that was read is not a change: what is in it arrives named"
+        );
+    }
+
+    #[test]
+    fn a_scan_of_the_library_leaves_the_watch_quiet() {
+        // The loop this exists to keep out, for three different reasons: the
+        // inotify walk reports every open it makes, Windows calls a directory
+        // that was read modified, and FSEvents says nothing about a read at
+        // all. Walking the tree and reading a file is not a change, so it
+        // does not ask for the scan that would read it again.
+        let scratch = Scratch::new("scanning");
+        let album = scratch.0.join("An Album");
+        std::fs::create_dir_all(&album).expect("the album directory is made");
+        std::fs::write(album.join("song.wav"), b"not really audio").expect("the file is written");
+        let Some(watch) = spawn(&scratch.0, Arc::new(|| {})) else {
+            return;
+        };
+
+        // The watch has to be alive for the rest of this to say anything, and
+        // a file that appears is what says so.
+        std::fs::write(scratch.0.join("new.wav"), b"not really audio")
+            .expect("the file is written");
+        assert!(settle(&watch), "a new file is reported");
+        quiet(&watch);
+
+        let mut directories = vec![scratch.0.clone()];
+        while let Some(directory) = directories.pop() {
+            for entry in std::fs::read_dir(&directory).expect("the directory reads") {
+                let path = entry.expect("the entry reads").path();
+                if path.is_dir() {
+                    directories.push(path);
+                } else {
+                    std::fs::read(&path).expect("the file reads");
+                }
+            }
         }
 
-        assert!(watch.ended(), "the directory is looked for, and found gone");
+        // The reads are taken in and dropped, or never arrive; either way the
+        // window is not asked to scan.
+        std::thread::sleep(Duration::from_millis(500));
+        assert!(!watch.changed(), "a scan of the library is not a change");
     }
 
     #[test]
