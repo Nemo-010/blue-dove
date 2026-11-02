@@ -18,7 +18,11 @@ directory. Either way the directory you picked is scanned, even if its own
 name starts with a dot. Changing the setting scans again.
 
 The directory is remembered, so the next start scans it again and shows the
-library at once.
+library at once. It is scanned again every minute while the window runs, so a
+file added, moved or retagged outside the window shows up without one. That is
+what **File > Scan Automatically** covers, and it is on to begin with; turn it
+off and the library is only read when you ask, with **File > Rescan Library**
+or by changing the music directory.
 
 ## Find an album
 
@@ -443,8 +447,8 @@ you would rather have a solid window on a busy wallpaper.
 The music directory, the volume, the theme, the two playback modes, the
 column widths and which columns are shown, the open playlists and their
 tabs, and the window options (translucent, keep playing when closed,
-ignore hidden files, fit or fill the album art) are kept in `config.toml`
-under the platform's config directory:
+ignore hidden files, scan automatically, fit or fill the album art) are kept
+in `config.toml` under the platform's config directory:
 
 | Platform | File |
 |----------|------|

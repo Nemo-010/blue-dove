@@ -60,7 +60,7 @@ const IMAGE_EXTENSIONS: &[&str] = &["jpg", "jpeg", "png", "svg"];
 const PROGRESS_EVERY: usize = 200;
 
 /// One playable file and the tags read from it.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Track {
     /// Where the file lives.
     pub path: PathBuf,
@@ -228,6 +228,17 @@ impl Library {
     /// Whether the scan found nothing.
     pub fn is_empty(&self) -> bool {
         self.tracks.is_empty()
+    }
+
+    /// Whether `other` lists the files this one lists, with the same tags.
+    ///
+    /// A scan that found nothing new answers a library of the same tracks,
+    /// which the window has no reason to take in: taking one in rebuilds
+    /// every track, forms the albums again and writes the session file. The
+    /// albums are left out of the comparison because they are grouped and
+    /// sorted from the tracks, so the same tracks form the same albums.
+    pub fn same_as(&self, other: &Self) -> bool {
+        self.tracks == other.tracks
     }
 
     /// The directory at `path`, looked up through the tree.

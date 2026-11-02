@@ -8,7 +8,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::Receiver;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use eframe::egui;
 
@@ -23,6 +23,13 @@ use crate::waveform;
 
 /// Frames a smoke run draws before it closes the window.
 const SMOKE_FRAMES: u32 = 3;
+
+/// How long the window waits between the scans it runs on its own.
+///
+/// A scan stats every file the cache holds and reads only what changed, so a
+/// minute of it costs little; it is the wait before a file added outside the
+/// window shows up, which is the whole point of scanning on a timer.
+pub const SCAN_EVERY: Duration = Duration::from_secs(60);
 
 /// Height of one track row, in points.
 pub const ROW_HEIGHT: f32 = 22.0;
@@ -271,6 +278,23 @@ pub struct App {
     pub(crate) background: bool,
     /// Whether the scan leaves out files and directories starting with a dot.
     pub(crate) ignore_hidden: bool,
+    /// Whether the music directory is scanned at startup and while the window
+    /// runs, so a file added outside the window shows up on its own.
+    pub(crate) auto_scan: bool,
+    /// When a scan last ended, for the one that runs while the window runs.
+    ///
+    /// `None` is a run that has not scanned yet, which reads as due: a window
+    /// whose library is empty has nothing to lose by looking at the directory
+    /// again.
+    pub(crate) scanned_at: Option<Instant>,
+    /// Whether the scan in flight was started by the timer rather than by the
+    /// user.
+    ///
+    /// A scan the timer started takes in only what changed: a library the
+    /// window already lists would be rebuilt track by track, have its album
+    /// list put back to the first album, and write the session file, every
+    /// minute and for nothing.
+    pub(crate) scan_quiet: bool,
     /// Whether the album art is fitted whole into its square, rather than
     /// cropped to fill it.
     pub(crate) cover_fit: bool,
@@ -355,6 +379,7 @@ impl App {
         let background = config.background.unwrap_or(false);
         let ignore_hidden = config.ignore_hidden.unwrap_or(true);
         let cover_fit = config.cover_fit.unwrap_or(false);
+        let auto_scan = config.auto_scan.unwrap_or(true);
         let preview_enabled = config.preview.unwrap_or(true);
         // The bus is reached on a thread of its own, so a host without one,
         // or with one that is slow to answer, never holds up the window.
@@ -408,6 +433,9 @@ impl App {
             pending_paths: (!paths.is_empty()).then_some(paths),
             background,
             ignore_hidden,
+            auto_scan,
+            scanned_at: None,
+            scan_quiet: false,
             cover_fit,
             preview_enabled,
             preview: None,
@@ -423,10 +451,24 @@ impl App {
                 // The last scan is shown at once, so the window opens with
                 // its albums and playlists in place; the scan that follows
                 // picks up whatever changed.
-                if !smoke && let Some(library) = crate::library::read_cache(&directory) {
-                    app.adopt_library(library);
+                let cached = if !smoke {
+                    match crate::library::read_cache(&directory) {
+                        Some(library) => {
+                            app.adopt_library(library);
+                            true
+                        }
+                        None => false,
+                    }
+                } else {
+                    false
+                };
+                // The scan at startup is one of the two the automatic scan
+                // covers. A directory the cache knows nothing about is
+                // scanned anyway: an empty window would leave nothing to play,
+                // and the next start would learn nothing about the directory.
+                if app.auto_scan || !cached {
+                    app.start_scan(directory);
                 }
-                app.start_scan(directory)
             }
             None => {
                 // A path on the command line says where the music is, which
@@ -765,7 +807,52 @@ impl App {
     /// Scans `directory`, replacing the library when the scan finishes.
     pub fn start_scan(&mut self, directory: PathBuf) {
         self.status = None;
+        self.scan_quiet = false;
         self.scan = Some((crate::library::spawn_scan(directory, self.ignore_hidden), 0));
+    }
+
+    /// Scans `directory` on the timer's behalf, taking in only what changed.
+    ///
+    /// It is the same scan as a rescan by hand, but its answer is read
+    /// quietly: a scan that found nothing new answers a library the window
+    /// already lists, and taking that in would rebuild it, put the album list
+    /// back where it started and write the session file, for nothing.
+    fn start_quiet_scan(&mut self, directory: PathBuf) {
+        self.scan_quiet = true;
+        self.scan = Some((crate::library::spawn_scan(directory, self.ignore_hidden), 0));
+    }
+
+    /// Starts the scan the timer is due to run, when one is.
+    ///
+    /// Nothing is scanned with no directory to scan, with a scan already
+    /// running, or with the automatic scan turned off; the timer itself costs
+    /// nothing, so it is not stopped and restarted with those changes.
+    fn scan_when_due(&mut self) {
+        if !self.auto_scan || self.scan.is_some() {
+            return;
+        }
+        if matches!(self.scanned_at, Some(at) if at.elapsed() < SCAN_EVERY) {
+            return;
+        }
+        let Some(directory) = self.config.music_directory.clone() else {
+            return;
+        };
+        self.start_quiet_scan(directory);
+    }
+
+    /// How long until the scan the timer runs is due.
+    ///
+    /// `None` when no scan is due at all: the automatic scan is off, there is
+    /// no directory to scan, or a scan is already running, which says so in
+    /// its own way.
+    fn scan_due_in(&self) -> Option<Duration> {
+        if !self.auto_scan || self.scan.is_some() || self.config.music_directory.is_none() {
+            return None;
+        }
+        Some(match self.scanned_at {
+            Some(at) => SCAN_EVERY.saturating_sub(at.elapsed()),
+            None => Duration::ZERO,
+        })
     }
 
     /// Opens a directory, remembers it and scans it.
@@ -777,6 +864,9 @@ impl App {
 
     /// Takes in what the background threads have finished.
     fn poll_workers(&mut self, ctx: &egui::Context) {
+        // The scan the timer is due to run starts here, so a file added
+        // outside the window is picked up while the window runs.
+        self.scan_when_due();
         let mut finished = false;
         let mut scanned: Option<Box<Library>> = None;
         if let Some((receiver, seen)) = &mut self.scan {
@@ -797,10 +887,19 @@ impl App {
         // The scan has to end before the library is swapped in, since the
         // playlists have to be carried over to it.
         if let Some(library) = scanned {
-            self.adopt_library(*library);
+            // A scan the timer started answers with the same library as often
+            // as not, and taking that in would undo what the window shows for
+            // nothing.
+            if !self.scan_quiet || !self.library.same_as(&library) {
+                self.adopt_library(*library);
+            }
         }
         if finished {
             self.scan = None;
+            self.scan_quiet = false;
+            // The timer counts from the end of a scan, so a scan of a large
+            // directory is not followed by another the moment it lands.
+            self.scanned_at = Some(Instant::now());
             if self.library.is_empty() && self.status.is_none() {
                 self.status = Some("No music found in that directory".to_string());
             }
@@ -851,6 +950,11 @@ impl App {
             || self.pictures.pending()
         {
             ctx.request_repaint_after(Duration::from_millis(120));
+        } else if let Some(wait) = self.scan_due_in() {
+            // The timer is read once a frame, and an idle window draws none:
+            // without this the scan due in a minute would wait for the next
+            // key press or pointer move to run.
+            ctx.request_repaint_after(wait.max(Duration::from_millis(120)));
         }
     }
 
@@ -1729,6 +1833,23 @@ impl App {
         self.cover_fit = cover_fit;
         self.config.cover_fit = Some(cover_fit);
         self.save_settings();
+    }
+
+    /// Turns the automatic scan on or off, and remembers it.
+    ///
+    /// Switching it on scans at once: the setting covers the scan at startup
+    /// and the one on a timer, and waiting a minute is long enough for the
+    /// new setting to look as though it did nothing.
+    pub fn set_auto_scan(&mut self, auto_scan: bool) {
+        self.auto_scan = auto_scan;
+        self.config.auto_scan = Some(auto_scan);
+        self.save_settings();
+        if auto_scan
+            && self.scan.is_none()
+            && let Some(directory) = self.config.music_directory.clone()
+        {
+            self.start_scan(directory);
+        }
     }
 
     /// Leaves hidden files out of the scan, or stops doing so.
@@ -3885,6 +4006,112 @@ pub(crate) mod tests {
             [0],
             "the playlist is kept for when the directory comes back"
         );
+    }
+
+    /// A scan that has already answered, so a frame can take it in.
+    fn finished(library: Library) -> Receiver<ScanMessage> {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let _ = sender.send(ScanMessage::Done(Box::new(library)));
+        receiver
+    }
+
+    #[test]
+    fn the_scan_the_timer_runs_leaves_an_unchanged_library_alone() {
+        // A minute of music playing with nothing added answers the library
+        // the window already lists. Taking that in would put the album list
+        // back at its first album and queue pictures it has already drawn.
+        let mut app = app_with(&[("One", &["A", "B"]), ("Two", &["C"])]);
+        app.open_album(1);
+        // With no row selected there is nothing for the library to be rebuilt
+        // around, so a library taken in again shows the first album.
+        app.select(None);
+        let listed = Library::from_tracks(app.library.tracks.clone());
+        app.scan = Some((finished(listed), 0));
+        app.scan_quiet = true;
+
+        app.poll_workers(&egui::Context::default());
+
+        assert!(app.scan.is_none(), "the scan ended");
+        assert!(!app.scan_quiet, "the next scan is a fresh request");
+        assert_eq!(
+            app.view.album,
+            Some(1),
+            "the album list stays on the album it showed"
+        );
+    }
+
+    #[test]
+    fn the_scan_the_timer_runs_takes_in_what_changed() {
+        let mut app = app_with(&[("One", &["A"])]);
+        let mut tracks = app.library.tracks.clone();
+        tracks.push(track("Two", 1, "B"));
+        app.scan = Some((finished(Library::from_tracks(tracks)), 0));
+        app.scan_quiet = true;
+
+        app.poll_workers(&egui::Context::default());
+
+        assert_eq!(app.library.tracks.len(), 2, "the new file is listed");
+        assert_eq!(app.view.album, Some(0), "and the list is rebuilt");
+    }
+
+    #[test]
+    fn a_rescan_by_hand_takes_the_library_in_even_when_nothing_changed() {
+        // The one the user asked for says so by being clicked, so it is taken
+        // in whatever it answers: a rescan that finds the same tracks is not
+        // a reason to look as though the click did nothing.
+        let mut app = app_with(&[("One", &["A", "B"]), ("Two", &["C"])]);
+        app.open_album(1);
+        app.select(None);
+        let listed = Library::from_tracks(app.library.tracks.clone());
+        app.scan = Some((finished(listed), 0));
+
+        app.poll_workers(&egui::Context::default());
+
+        assert_eq!(app.view.album, Some(0), "the library is taken in again");
+    }
+
+    #[test]
+    fn the_timer_scans_once_a_minute_has_passed() {
+        let mut app = app_with(&[("One", &["A"])]);
+        app.config.music_directory = Some(std::env::temp_dir());
+        app.auto_scan = true;
+        let ctx = egui::Context::default();
+
+        // A run that has not scanned yet is due at once, which is what a
+        // window whose library is empty has to lose nothing by.
+        app.scanned_at = None;
+        app.poll_workers(&ctx);
+        assert!(app.scan.is_some(), "a scan starts when one is due");
+
+        app.scan = None;
+        app.scanned_at = Some(Instant::now());
+        app.poll_workers(&ctx);
+        assert!(app.scan.is_none(), "a minute has not passed yet");
+    }
+
+    #[test]
+    fn the_automatic_scan_can_be_turned_off() {
+        let mut app = app_with(&[("One", &["A"])]);
+        app.config.music_directory = Some(std::env::temp_dir());
+        app.set_auto_scan(false);
+        app.scanned_at = None;
+
+        app.poll_workers(&egui::Context::default());
+
+        assert!(app.scan.is_none(), "nothing is scanned with the timer off");
+        assert_eq!(app.config.auto_scan, Some(false), "and it is remembered");
+    }
+
+    #[test]
+    fn turning_the_automatic_scan_on_scans_at_once() {
+        // The setting covers the scan at startup and the one on a timer, so
+        // waiting a minute for either would look as though it did nothing.
+        let mut app = app_with(&[("One", &["A"])]);
+        app.config.music_directory = Some(std::env::temp_dir());
+
+        app.set_auto_scan(true);
+
+        assert!(app.scan.is_some(), "a scan starts with the setting");
     }
 
     #[test]

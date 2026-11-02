@@ -560,6 +560,16 @@ impl App {
                             self.start_scan(directory);
                         }
                     }
+                    self.setting_checkbox(
+                        ui,
+                        "Scan Automatically",
+                        self.auto_scan,
+                        Self::set_auto_scan,
+                    )
+                    .on_hover_text(
+                        "Scans the music directory at startup and every minute while \
+                         the window runs, so new files show up without a rescan",
+                    );
                     ui.separator();
                     self.setting_checkbox(
                         ui,
