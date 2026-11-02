@@ -17,8 +17,10 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver};
 
+use notify::event::{EventKind, ModifyKind, RemoveKind};
 use notify::{RecommendedWatcher, RecursiveMode, Watcher as _};
 
 /// Called after an event, so the window draws and takes it in.
@@ -32,9 +34,19 @@ pub struct Watch {
     _watcher: RecommendedWatcher,
     /// Events seen and not taken yet.
     events: Receiver<()>,
+    /// Whether the watch ended, which the kernel does not say twice.
+    ///
+    /// A directory that is deleted, renamed or unmounted takes its watch with
+    /// it, and nothing under that path is reported again: the window has to
+    /// place a new one, and this is how it learns to.
+    ended: Arc<AtomicBool>,
 }
 
 impl Watch {
+    /// Whether the watch on the directory ended, and a new one is needed.
+    pub fn ended(&self) -> bool {
+        self.ended.load(Ordering::Relaxed)
+    }
     /// Whether anything under the directory changed since the last call.
     ///
     /// Every event the platform reported counts as one, since they are all
@@ -62,21 +74,61 @@ impl Watch {
 /// to open the window.
 pub fn spawn(directory: &Path, wake: Waker) -> Option<Watch> {
     let (sender, events) = mpsc::channel();
+    let ended = Arc::new(AtomicBool::new(false));
+    let ended_by_event = Arc::clone(&ended);
+    let root = directory.to_path_buf();
+    let watched = root.clone();
     let mut watcher = notify::recommended_watcher(move |result: notify::Result<notify::Event>| {
-        // A backend that could not watch something answers with an error
-        // rather than an event, which leaves nothing for the window to take
-        // in: the file it could not see arrives with the next full scan.
-        if result.is_ok() && sender.send(()).is_ok() {
-            wake();
+        let root = watched.clone();
+        let ended = Arc::clone(&ended_by_event);
+        match result {
+            // The directory itself going away ends the watch, and the kernel
+            // says so once: a watch that is not replaced watches nothing.
+            Ok(event) if ends_the_watch(&event, &root) => {
+                ended.store(true, Ordering::Relaxed);
+                if sender.send(()).is_ok() {
+                    wake();
+                }
+            }
+            Ok(_) => {
+                if sender.send(()).is_ok() {
+                    wake();
+                }
+            }
+            // A backend that could not watch something answers with an error
+            // rather than an event, which leaves nothing for the window to
+            // take in: the file it could not see arrives with the next full
+            // scan, and the watch is placed again.
+            Err(_) => {
+                ended.store(true, Ordering::Relaxed);
+                if sender.send(()).is_ok() {
+                    wake();
+                }
+            }
         }
     })
     .ok()?;
     watcher.watch(directory, RecursiveMode::Recursive).ok()?;
     Some(Watch {
-        root: directory.to_path_buf(),
+        root,
         _watcher: watcher,
         events,
+        ended,
     })
+}
+
+/// Whether `event` says the watched directory itself is gone.
+///
+/// A watch is placed on the directory and on everything below it; the one on
+/// the directory ends when the directory is removed or renamed away, and the
+/// kernel reports that once. Anything else is a change to take in.
+fn ends_the_watch(event: &notify::Event, root: &Path) -> bool {
+    let gone = matches!(
+        event.kind,
+        EventKind::Remove(RemoveKind::Folder | RemoveKind::Any)
+            | EventKind::Modify(ModifyKind::Name(_))
+    );
+    gone && event.paths.iter().any(|path| path == root)
 }
 
 #[cfg(test)]
@@ -150,6 +202,34 @@ mod tests {
         std::fs::write(album.join("song.wav"), b"not really audio").expect("the file is written");
 
         assert!(settle(&watch), "a file two levels down is reported");
+    }
+
+    #[test]
+    fn the_watched_directory_going_away_ends_the_watch() {
+        // A watch on a directory that is removed or moved away watches
+        // nothing, and the kernel says so once. The window reads this to
+        // place a new one, since nothing under the old path is reported.
+        let root = Path::new("/music");
+        let removed = notify::Event::new(EventKind::Remove(RemoveKind::Folder))
+            .add_path(PathBuf::from("/music"));
+        let moved = notify::Event::new(EventKind::Modify(ModifyKind::Name(
+            notify::event::RenameMode::From,
+        )))
+        .add_path(PathBuf::from("/music"));
+        let file = notify::Event::new(EventKind::Remove(RemoveKind::File))
+            .add_path(PathBuf::from("/music/song.wav"));
+        let written = notify::Event::new(EventKind::Modify(ModifyKind::Data(
+            notify::event::DataChange::Any,
+        )))
+        .add_path(PathBuf::from("/music/song.wav"));
+
+        assert!(ends_the_watch(&removed, root), "the directory was removed");
+        assert!(ends_the_watch(&moved, root), "or renamed away");
+        assert!(
+            !ends_the_watch(&file, root),
+            "a file under it is a change, not the end of the watch"
+        );
+        assert!(!ends_the_watch(&written, root), "and so is a write");
     }
 
     #[test]

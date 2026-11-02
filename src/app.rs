@@ -235,6 +235,9 @@ pub struct App {
     /// One at a time: the square shows one track, and a texture per track
     /// ever played would keep megabytes of pixels nothing draws.
     pub(crate) big_art: Option<BigArt>,
+    /// The size the square is waiting for, so a size it grew past is dropped
+    /// rather than decoded and kept.
+    pub(crate) big_asked: Option<String>,
     /// Pictures decoded off the drawing thread.
     ///
     /// A start decodes none of them: the window asks for the ones it is about
@@ -456,6 +459,7 @@ impl App {
             wave_columns: None,
             textures: HashMap::new(),
             big_art: None,
+            big_asked: None,
             pictures: crate::art::Art::default(),
             audio: None,
             playing: None,
@@ -931,12 +935,14 @@ impl App {
             self.watch = None;
             return;
         };
-        if self
-            .watch
-            .as_ref()
-            .is_some_and(|watch| watch.root() == directory)
-        {
-            return;
+        if let Some(watch) = &self.watch {
+            // A watch that ended -- the directory was removed, renamed or
+            // unmounted -- is replaced rather than kept: it reports nothing
+            // from here on, and the path still matching would hide that.
+            if watch.root() == directory && !watch.ended() {
+                return;
+            }
+            self.watch = None;
         }
         if matches!(&self.watch_failed, Some((root, at)) if *root == directory && at.elapsed() < WATCH_RETRY)
         {
@@ -977,6 +983,7 @@ impl App {
         }
         self.scan_when_due();
         let mut finished = false;
+        let mut failed = false;
         let mut scanned: Option<Box<Library>> = None;
         if let Some((receiver, seen)) = &mut self.scan {
             while let Ok(message) = receiver.try_recv() {
@@ -988,6 +995,7 @@ impl App {
                     }
                     ScanMessage::Failed(error) => {
                         self.status = Some(error);
+                        failed = true;
                         finished = true;
                     }
                 }
@@ -1007,8 +1015,15 @@ impl App {
             self.scan = None;
             self.scan_quiet = false;
             // The timer counts from the end of a scan, so a scan of a large
-            // directory is not followed by another the moment it lands.
-            self.scanned_at = Some(Instant::now());
+            // directory is not followed by another the moment it lands. A
+            // scan that failed is not a scan, though: it read nothing, so the
+            // next one is a minute off rather than an hour, which is the case
+            // an unmounted share runs into and comes back from.
+            if failed {
+                self.scan_after = Some(Instant::now() + WATCH_RETRY);
+            } else {
+                self.scanned_at = Some(Instant::now());
+            }
             if self.library.is_empty() && self.status.is_none() {
                 self.status = Some("No music found in that directory".to_string());
             }
@@ -1134,6 +1149,13 @@ impl App {
     /// than moving on, so one press goes to its start and a second goes to
     /// the track before it.
     pub fn step(&mut self, forward: bool) {
+        // The preview has no playlist behind it, so there is nothing to step
+        // to; the keyboard would otherwise walk the library out from under a
+        // window that is showing one file, and MPRIS would then name the
+        // preview while the library played.
+        if self.preview.is_some() {
+            return;
+        }
         let Some(current) = self.playing.or(self.view.selected) else {
             if let Some(&first) = self.playlists.current().tracks.first() {
                 self.play(first);
@@ -1687,6 +1709,12 @@ impl App {
     /// Playing a row by hand goes back to walking the playlist, rather than
     /// the queue an earlier selection started.
     pub fn play_selection(&mut self) {
+        // A row cannot be played while the preview shows: the preview window
+        // draws no table, so a press that reached here came from the keyboard
+        // on a window whose rows are not there.
+        if self.preview.is_some() {
+            return;
+        }
         let Some(index) = self.view.selected else {
             return;
         };
@@ -1788,20 +1816,29 @@ impl App {
             // Nothing loaded, so the big picture of the last track is dropped
             // rather than kept for a square that no longer shows art.
             self.big_art = None;
+            self.wait_for_big(None);
             return None;
         };
         let pixels = (side * ctx.pixels_per_point()).round().max(1.0) as u32;
         let size = crate::cover::decoded_size(pixels);
         if size <= crate::cover::THUMBNAIL {
+            // The square is small enough that the thumbnail fills it, so the
+            // picture of its own size is not wanted any more either.
+            self.big_art = None;
+            self.wait_for_big(None);
             return self.cover_texture(ctx, &key);
         }
-        if let Some(big) = &self.big_art
-            && big.side == size
-            && big.key == key
-        {
-            return Some(big.texture.clone());
+        if let Some(big) = &self.big_art {
+            if big.side == size && big.key == key {
+                return Some(big.texture.clone());
+            }
+            // The square has taken another size, or another track is loaded:
+            // the texture held is not one this frame draws, and keeping it
+            // would collect one per step of a resize.
+            self.big_art = None;
         }
         let asked = crate::art::sized_key(&key, size);
+        self.wait_for_big(Some(&asked));
         let Some(cover) = self.pictures.decoded(&asked) else {
             self.pictures.request(&asked);
             return self.cover_texture(ctx, &key);
@@ -1819,6 +1856,23 @@ impl App {
             texture: texture.clone(),
         });
         Some(texture)
+    }
+
+    /// Makes `key` the picture size the square is waiting for, dropping the
+    /// one it waited for before.
+    ///
+    /// A size the square grew past is not waited for: its decode is a few
+    /// megabytes, and the frame that asked for it is not the frame that draws
+    /// it any more. Dropping it here is what keeps a window widened while the
+    /// picture decoded from holding both sizes, the smaller one for good.
+    fn wait_for_big(&mut self, key: Option<&str>) {
+        if self.big_asked.as_deref() == key {
+            return;
+        }
+        if let Some(previous) = self.big_asked.take() {
+            self.pictures.forget(&[previous]);
+        }
+        self.big_asked = key.map(str::to_string);
     }
 
     /// The key of the cover of the loaded track, when it has one.
@@ -2119,11 +2173,27 @@ impl App {
             .and_then(|index| track_path(&self.library, index));
 
         // A scan that finds nothing, with a playlist that held something, is
-        // a directory that went away rather than one that was emptied; the
-        // session is left as it was so the next run can still open it.
-        let vanished = library.is_empty() && paths.iter().any(|tracks| !tracks.is_empty());
+        // a directory that went away rather than one that was emptied: the
+        // library the window lists, the playlists and the session are all left
+        // as they were. Taking the empty answer in would empty the window
+        // under the user, with every row it drew pointing at nothing, which is
+        // what an unmounted share looks like from here.
+        if library.is_empty() && paths.iter().any(|tracks| !tracks.is_empty()) {
+            return;
+        }
+
+        // The queue a "play the selection" started is indices into the track
+        // list about to be replaced, so it is found again by path, the way the
+        // playlists are.
+        let queue: Option<Vec<PathBuf>> = self.queue.as_ref().map(|indices| {
+            indices
+                .iter()
+                .filter_map(|&index| track_path(&self.library, index))
+                .collect()
+        });
 
         self.library = library;
+        self.remap_queue(queue);
         // Textures and decoded pictures are keyed by the content of a cover,
         // so a rescan that names the same ones keeps them: clearing both would
         // blink the visible art back to placeholders and decode it again.
@@ -2137,13 +2207,33 @@ impl App {
         self.pictures.prefetch(covers);
         self.view.album = (!self.library.albums.is_empty()).then_some(0);
 
-        if vanished {
-            return;
-        }
         if paths.iter().any(|tracks| !tracks.is_empty()) {
             self.remap_playlists(paths, selected, playing);
         } else {
             self.restore_playlists();
+        }
+    }
+
+    /// Finds the walking queue again in the library just scanned.
+    ///
+    /// A queue holds indices into the track list, which a scan replaces: a
+    /// file added above the playing track shifts every index below it, and the
+    /// next step would walk to a track that is not there, which stops playback
+    /// without a word. The shuffle order is dropped rather than remapped,
+    /// since it is a drawn order and drawing it again costs nothing.
+    fn remap_queue(&mut self, queue: Option<Vec<PathBuf>>) {
+        if let Some(paths) = queue {
+            let positions = track_positions(&self.library);
+            let found: Vec<usize> = paths
+                .iter()
+                .filter_map(|path| positions.get(path.as_path()).copied())
+                .collect();
+            // A queue whose tracks all went away falls back to the playlist,
+            // which is what walking it would do by hand.
+            self.queue = (!found.is_empty()).then_some(found);
+        }
+        if self.shuffle.is_some() {
+            self.forget_shuffle();
         }
     }
 
@@ -3432,6 +3522,29 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn the_preview_does_not_start_the_library_behind_it() {
+        // The preview shows one file, with no playlist behind it, and the
+        // keyboard transport still reaches step() and play_selection().
+        // Walking the library there plays a track the window does not show,
+        // and MPRIS then reports the previewed file while the library plays.
+        //
+        // A play of these tracks cannot succeed, since their files are not
+        // there, so the status line is what says whether one was even tried.
+        let mut app = app_with(&[("One", &["A", "B"]), ("Two", &["C"])]);
+        app.preview = Some(app.library.tracks[0].clone());
+        app.view.selected = Some(1);
+        app.status = None;
+
+        app.step(true);
+        assert_eq!(app.playing, None, "the preview is not stepped away from");
+        assert!(app.status.is_none(), "and no track was started");
+
+        app.play_selection();
+        assert_eq!(app.playing, None, "the selected row is not played");
+        assert!(app.status.is_none(), "and no track was started");
+    }
+
+    #[test]
     fn a_playlist_play_answers_a_step_and_a_stop() {
         let app = app_with(&[("One", &["A", "B"])]);
         for command in [
@@ -4244,6 +4357,54 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_picture_size_the_square_grew_past_is_not_kept() {
+        // A window widened while the picture decoded asks for a second size
+        // before the first lands. Both would be held, a cover of that size
+        // being a few megabytes, though nothing draws the smaller one again.
+        fn stored(width: usize) -> String {
+            let cover = crate::cover::Cover {
+                width,
+                height: width,
+                rgba: [10, 20, 30, 255].repeat(width * width),
+            };
+            let bytes = crate::cover::to_png(&cover).expect("the picture encodes");
+            crate::cache::store_cover(&bytes).expect("the picture is stored")
+        }
+
+        let mut app = app_with(&[("One", &["A"])]);
+        let key = stored(800);
+        let mut track = app.library.tracks[0].clone();
+        track.cover = Some(key.clone());
+        app.library = Library::from_tracks(vec![track]);
+        app.open_album(0);
+        app.playing = Some(0);
+
+        let ctx = egui::Context::default();
+        let small = crate::art::sized_key(&key, 640);
+        let large = crate::art::sized_key(&key, 896);
+        // The square is 600 points wide, and the window is widened to 700
+        // before the picture of that size lands. Nothing polls in between, so
+        // the smaller ask is still outstanding when the larger one is made.
+        app.playing_art(&ctx, 600.0);
+        app.playing_art(&ctx, 700.0);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while app.pictures.decoded(&large).is_none() {
+            app.pictures.poll();
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the picture of the size the square is drawn at never arrived"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+
+        assert!(
+            app.pictures.decoded(&small).is_none(),
+            "the size the square grew past is not held"
+        );
+    }
+
+    #[test]
     fn the_big_square_is_drawn_from_art_of_its_own_size() {
         // The album lists draw a cover the size of a row, which a thumbnail
         // fills. The square above the controls is drawn as wide as the
@@ -4382,6 +4543,53 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_scan_that_finds_nothing_does_not_empty_the_window() {
+        // A directory that went away answers an empty library. Taking that in
+        // would empty the album list under the user, with every row it drew
+        // pointing at a track that is no longer there, which is what an
+        // unmounted share looks like from here.
+        let mut app = app_with(&[("One", &["A", "B"]), ("Two", &["C"])]);
+        app.playing = Some(1);
+
+        app.adopt_library(Library::default());
+
+        assert_eq!(app.library.tracks.len(), 3, "the library is kept");
+        assert_eq!(app.view.album, Some(0), "and so is the album it shows");
+        assert_eq!(app.playing, Some(1), "and the track that plays");
+    }
+
+    #[test]
+    fn a_rescan_keeps_the_walking_queue_on_the_same_tracks() {
+        // The queue a "play the selection" started is indices into the track
+        // list, and a scan replaces that list: a file that arrives above a
+        // queued track shifts every index below it, and the next step walks
+        // to a track that is not there, which stops playback without a word.
+        let mut app = app_with(&[("One", &["A", "B"]), ("Two", &["C"])]);
+        app.queue = Some(vec![1, 2]);
+        app.shuffle = Some(vec![0, 1, 2]);
+        let queued: Vec<PathBuf> = [1, 2]
+            .iter()
+            .map(|&index| app.library.tracks[index].path.clone())
+            .collect();
+
+        // A file that sorts before every track listed arrives.
+        let mut tracks = vec![track("One", 1, "0")];
+        tracks.extend(app.library.tracks.clone());
+        app.adopt_library(Library::from_tracks(tracks));
+
+        let queue = app.queue.clone().expect("the queue is kept");
+        let after: Vec<PathBuf> = queue
+            .iter()
+            .map(|&index| app.library.tracks[index].path.clone())
+            .collect();
+        assert_eq!(after, queued, "the queue names the same files");
+        assert!(
+            app.shuffle.is_none(),
+            "the shuffled order is drawn again rather than remapped"
+        );
+    }
+
+    #[test]
     fn a_scan_that_finds_nothing_leaves_the_session_alone() {
         let mut app = app_with(&[("One", &["A"])]);
         app.adopt_library(Library::default());
@@ -4398,6 +4606,43 @@ pub(crate) mod tests {
         let (sender, receiver) = std::sync::mpsc::channel();
         let _ = sender.send(ScanMessage::Done(Box::new(library)));
         receiver
+    }
+
+    /// A scan that has already failed, so a frame can take it in.
+    fn failed(error: &str) -> Receiver<ScanMessage> {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let _ = sender.send(ScanMessage::Failed(error.to_string()));
+        receiver
+    }
+
+    #[test]
+    fn a_scan_that_failed_is_not_counted_as_a_scan() {
+        // A share that is unmounted mid-session fails one scan. Counting that
+        // as a scan would leave the next one an hour off, on exactly the
+        // storage the fallback is there for.
+        let mut app = app_with(&[("One", &["A"])]);
+        app.config.music_directory = Some(std::env::temp_dir());
+        app.auto_scan = true;
+        app.scanned_at = None;
+        app.scan = Some((failed("that directory is not there"), 0));
+
+        app.poll_workers(&egui::Context::default());
+
+        assert!(app.scan.is_none(), "the scan ended");
+        assert!(
+            app.scanned_at.is_none(),
+            "a scan that read nothing does not count as a scan"
+        );
+        assert!(
+            app.scan_after
+                .is_some_and(|after| after <= Instant::now() + WATCH_RETRY),
+            "so the next one is a minute off rather than an hour"
+        );
+
+        // And the retry is not the next frame: a share that is still away
+        // would fail again on every one of them.
+        app.poll_workers(&egui::Context::default());
+        assert!(app.scan.is_none(), "the retry waits its minute");
     }
 
     #[test]
@@ -4540,6 +4785,50 @@ pub(crate) mod tests {
         assert!(
             app.scan_after.is_some(),
             "the change is noted, so a scan follows once it settles"
+        );
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn a_watch_that_ended_is_replaced() {
+        // A directory deleted, renamed or unmounted takes its watch with it,
+        // and the kernel says so once. Keeping the dead watch because its path
+        // still matches leaves the hourly fallback as the only thing that
+        // notices, so a file written after the directory comes back stays
+        // invisible for an hour.
+        let directory =
+            std::env::temp_dir().join(format!("blue-dove-replaced-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).expect("the directory is made");
+        let mut app = app_with(&[("One", &["A"])]);
+        app.config.music_directory = Some(directory.clone());
+        app.auto_scan = true;
+        let ctx = egui::Context::default();
+        app.poll_workers(&ctx);
+        if app.watch.is_none() {
+            // A host that cannot watch a directory has only the fallback.
+            let _ = std::fs::remove_dir_all(&directory);
+            return;
+        }
+
+        std::fs::remove_dir_all(&directory).expect("the directory goes");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !app.watch.as_ref().is_some_and(crate::watch::Watch::ended)
+            && Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            app.watch.as_ref().is_some_and(crate::watch::Watch::ended),
+            "the watch on the removed directory ended"
+        );
+
+        // The directory comes back, and with it a watch that reports changes.
+        std::fs::create_dir_all(&directory).expect("the directory comes back");
+        app.poll_workers(&ctx);
+        assert!(
+            app.watch.as_ref().is_some_and(|watch| !watch.ended()),
+            "a live watch is placed on the directory that came back"
         );
         let _ = std::fs::remove_dir_all(&directory);
     }

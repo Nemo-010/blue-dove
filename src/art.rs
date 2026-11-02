@@ -123,6 +123,13 @@ impl Art {
         };
         let mut drawn = false;
         while let Ok((key, cover)) = worker.results.try_recv() {
+            // A key dropped while it decoded -- a size the square grew past,
+            // a picture uploaded already -- is not taken in. Keeping it would
+            // hold its megabytes for a picture nothing draws, and undo the
+            // forget that dropped it.
+            if !self.asked.contains(&key) {
+                continue;
+            }
             drawn |= self.drawn.remove(&key);
             if let Entry::Vacant(slot) = self.decoded.entry(key.clone()) {
                 slot.insert(cover);
