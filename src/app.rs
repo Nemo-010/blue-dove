@@ -184,6 +184,16 @@ pub struct View {
     pub rename_buffer: String,
 }
 
+/// A cover uploaded at the size the big square draws it.
+pub(crate) struct BigArt {
+    /// The key of the picture, so another track's art is not mistaken for it.
+    key: String,
+    /// The size it was decoded at, in pixels.
+    side: u32,
+    /// The texture the window draws.
+    texture: egui::TextureHandle,
+}
+
 /// Everything the window draws, and the state behind it.
 pub struct App {
     /// Whether the window closes itself after [`SMOKE_FRAMES`] frames.
@@ -214,6 +224,11 @@ pub struct App {
     pub(crate) wave_columns: Option<(usize, u32, usize, Vec<f32>)>,
     /// Textures for covers, keyed by the key their picture is stored under.
     pub(crate) textures: HashMap<String, egui::TextureHandle>,
+    /// The cover of the loaded track at the size the big square draws it.
+    ///
+    /// One at a time: the square shows one track, and a texture per track
+    /// ever played would keep megabytes of pixels nothing draws.
+    pub(crate) big_art: Option<BigArt>,
     /// Pictures decoded off the drawing thread.
     ///
     /// A start decodes none of them: the window asks for the ones it is about
@@ -434,6 +449,7 @@ impl App {
             peaks: Vec::new(),
             wave_columns: None,
             textures: HashMap::new(),
+            big_art: None,
             pictures: crate::art::Art::default(),
             audio: None,
             playing: None,
@@ -1742,11 +1758,77 @@ impl App {
             return None;
         };
         let cover = cover?;
-        let image =
-            egui::ColorImage::from_rgba_unmultiplied([cover.width, cover.height], &cover.rgba);
-        let texture = ctx.load_texture(format!("cover-{key}"), image, egui::TextureOptions::LINEAR);
+        let texture = upload(ctx, key, &cover);
         self.textures.insert(key.to_string(), texture.clone());
         Some(texture)
+    }
+
+    /// Texture for the cover of the loaded track, at the size it is drawn.
+    ///
+    /// The album lists draw covers the size of a row, which the thumbnail
+    /// decoded for them fills exactly. The square above the controls is drawn
+    /// as wide as the window instead, so the thumbnail stretched over it reads
+    /// blurry: the picture is decoded again at the size that square has, in
+    /// whole pixels of the screen, and kept as the one texture the window
+    /// shows at that size. Dropping the pixels once they are uploaded is what
+    /// keeps that from being a cover per track ever played: a decoded picture
+    /// this large is a few megabytes, and the textures are what is worth
+    /// keeping.
+    ///
+    /// A picture still being decoded leaves the thumbnail on screen rather
+    /// than nothing, so the art does not blink as the square takes a new size.
+    pub fn playing_art(&mut self, ctx: &egui::Context, side: f32) -> Option<egui::TextureHandle> {
+        let Some(key) = self.loaded_cover_key() else {
+            // Nothing loaded, so the big picture of the last track is dropped
+            // rather than kept for a square that no longer shows art.
+            self.big_art = None;
+            return None;
+        };
+        let pixels = (side * ctx.pixels_per_point()).round().max(1.0) as u32;
+        let size = crate::cover::decoded_size(pixels);
+        if size <= crate::cover::THUMBNAIL {
+            return self.cover_texture(ctx, &key);
+        }
+        if let Some(big) = &self.big_art
+            && big.side == size
+            && big.key == key
+        {
+            return Some(big.texture.clone());
+        }
+        let asked = crate::art::sized_key(&key, size);
+        let Some(cover) = self.pictures.decoded(&asked) else {
+            self.pictures.request(&asked);
+            return self.cover_texture(ctx, &key);
+        };
+        let Some(cover) = cover else {
+            // No picture behind the key, which the thumbnail path has already
+            // answered for.
+            return self.cover_texture(ctx, &key);
+        };
+        let texture = upload(ctx, &asked, &cover);
+        self.pictures.forget(&[asked]);
+        self.big_art = Some(BigArt {
+            key,
+            side: size,
+            texture: texture.clone(),
+        });
+        Some(texture)
+    }
+
+    /// The key of the cover of the loaded track, when it has one.
+    ///
+    /// An album's cover is shared by its tracks; a loose track has no album
+    /// to take one from, so its own artwork is used. The preview's file is in
+    /// no library, so its cover is the file's own.
+    fn loaded_cover_key(&self) -> Option<String> {
+        if let Some(preview) = &self.preview {
+            return preview.cover.clone();
+        }
+        let track = self.playing?;
+        if let Some(album) = self.album_of(track) {
+            return self.library.albums.get(album)?.cover.clone();
+        }
+        self.library.tracks.get(track)?.cover.clone()
     }
 
     /// Texture for an album's cover.
@@ -1780,24 +1862,6 @@ impl App {
                     .get(track)
                     .is_some_and(|track| track.cover.is_some())
         })
-    }
-
-    /// Texture for the cover of the playing track.
-    ///
-    /// An album's cover is shared by its tracks; a loose track has no album
-    /// to take one from, so its own artwork is used. The two are kept in the
-    /// same cache under different keys.
-    pub fn playing_cover(&mut self, ctx: &egui::Context) -> Option<egui::TextureHandle> {
-        if let Some(preview) = &self.preview {
-            let key = preview.cover.clone()?;
-            return self.cover_texture(ctx, &key);
-        }
-        let track = self.playing?;
-        if let Some(album) = self.album_of(track) {
-            return self.album_cover(ctx, album);
-        }
-        let key = self.library.tracks.get(track)?.cover.clone()?;
-        self.cover_texture(ctx, &key)
     }
 
     /// The playback position, following the seek bar while it is dragged.
@@ -2735,6 +2799,15 @@ fn sane_columns(stored: [f32; 6]) -> [f32; 6] {
 /// The file the track at `index` came from, for saving it or finding it again.
 fn track_path(library: &Library, index: usize) -> Option<PathBuf> {
     library.tracks.get(index).map(|track| track.path.clone())
+}
+
+/// Uploads `cover` as a texture the window draws.
+///
+/// The picture arrives from the decoder thread in RGBA, which is what egui
+/// takes, so nothing is converted here.
+fn upload(ctx: &egui::Context, key: &str, cover: &crate::cover::Cover) -> egui::TextureHandle {
+    let image = egui::ColorImage::from_rgba_unmultiplied([cover.width, cover.height], &cover.rgba);
+    ctx.load_texture(format!("cover-{key}"), image, egui::TextureOptions::LINEAR)
 }
 
 /// Where each track of `library` sits, by the file it came from.
@@ -4021,6 +4094,85 @@ pub(crate) mod tests {
         assert!(
             wayland(none, Some(std::ffi::OsStr::new("7"))),
             "and so is a socket"
+        );
+    }
+
+    #[test]
+    fn the_big_square_is_drawn_from_art_of_its_own_size() {
+        // The album lists draw a cover the size of a row, which a thumbnail
+        // fills. The square above the controls is drawn as wide as the
+        // window, so it asks for the picture at that size instead of
+        // stretching a thumbnail over it and reading blurry.
+        fn stored(width: usize) -> String {
+            let cover = crate::cover::Cover {
+                width,
+                height: width,
+                rgba: [10, 20, 30, 255].repeat(width * width),
+            };
+            let bytes = crate::cover::to_png(&cover).expect("the picture encodes");
+            crate::cache::store_cover(&bytes).expect("the picture is stored")
+        }
+
+        /// Draws the square until the picture arrives, and answers its texture.
+        fn settle(app: &mut App, ctx: &egui::Context, side: f32) -> egui::TextureHandle {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            loop {
+                app.pictures.poll();
+                // Until the picture of its own size lands, the square answers
+                // with the thumbnail, so what says it landed is the texture
+                // being wider than one.
+                if let Some(texture) = app.playing_art(ctx, side)
+                    && texture.size()[0] > crate::cover::THUMBNAIL as usize
+                {
+                    return texture;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the picture of its own size never arrived"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        }
+
+        let mut app = app_with(&[("One", &["A"])]);
+        let key = stored(800);
+        let mut track = app.library.tracks[0].clone();
+        track.cover = Some(key);
+        app.library = Library::from_tracks(vec![track]);
+        app.open_album(0);
+        app.playing = Some(0);
+
+        let ctx = egui::Context::default();
+        // A square 600 points wide on a screen with no scaling is 600 pixels
+        // of art, rounded up to the next size a cover is decoded at.
+        let texture = settle(&mut app, &ctx, 600.0);
+        assert_eq!(
+            texture.size(),
+            [640, 640],
+            "the picture is decoded at the size the square is drawn"
+        );
+        let key = app
+            .library
+            .tracks
+            .first()
+            .and_then(|track| track.cover.clone())
+            .expect("the cover is named");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let thumbnail = loop {
+            app.pictures.poll();
+            if let Some(texture) = app.cover_texture(&ctx, &key) {
+                break texture;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the thumbnail never arrived"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        };
+        assert_eq!(
+            thumbnail.size(),
+            [256, 256],
+            "the list keeps its thumbnail, so both sizes are available"
         );
     }
 
