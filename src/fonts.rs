@@ -1,10 +1,13 @@
-//! Fallback fonts for titles egui's own faces cannot draw.
+//! Fallback fonts for what egui's own faces cannot draw.
 //!
-//! egui's bundled fonts cover Latin only, so a library tagged in Japanese or
-//! Persian would draw boxes. A system font that carries those glyphs is
-//! loaded as a fallback, one per script, which costs nothing when none is
-//! installed. Letters still come out in the order the tags hold them, and
-//! unjoined: egui has no bidirectional layout and no shaping to apply.
+//! egui's bundled faces cover Latin, Greek and Cyrillic, and Latin only in
+//! the precomposed letters it ships with: no combining mark, no Vietnamese
+//! letter, no note glyph. A library tagged in Japanese or Persian would draw
+//! boxes, and so would a title with an accent stored as a letter and a mark.
+//! A system font that carries those glyphs is loaded as a fallback, one per
+//! script, which costs nothing when none is installed. Letters still come out
+//! in the order the tags hold them, and unjoined: egui has no bidirectional
+//! layout and no shaping to apply.
 //!
 //! Which font is installed differs from distribution to distribution and
 //! from user to user, so the font directories are searched rather than a
@@ -22,7 +25,12 @@ use eframe::egui::{self, FontData, FontDefinitions, FontFamily};
 /// Chinese and Korean titles, and both are preferred to a fallback face.
 const CJK: &[&str] = &[
     "notosanscjk",
+    "notosanskr",
     "notoserifcjk",
+    "nanum",
+    "malgun",
+    "gulim",
+    "batang",
     "sourcehansans",
     "sourcehanserif",
     "notosansjp",
@@ -74,9 +82,144 @@ const ARABIC: &[&str] = &[
     "dejavusans",
 ];
 
-/// One entry per script egui's bundled faces draw none of, each the file name
+/// File name fragments of fonts that carry the Latin letters the bundled face
+/// leaves out, best first.
+///
+/// Ubuntu Light has the precomposed letters of Latin Extended-A, which is why
+/// a Czech, Polish or Croatian title reads; it has no letter of Latin Extended
+/// Additional, so a Vietnamese title is boxes, and it has no combining mark at
+/// all. A title stored as `z` and a caron is therefore drawn as `z` and a box
+/// until a face that can place the mark is loaded. `notosansregular` is the
+/// plain face rather than the CJK one, which is preferred here for its
+/// accents; the CJK face is found for the script it is wanted for anyway.
+const LATIN: &[&str] = &[
+    "notosansregular",
+    "notosans",
+    "dejavusans",
+    "freesans",
+    "freeserif",
+];
+
+/// File name fragments of fonts that carry the symbols a title collects.
+///
+/// A title ends in a note, an arrow or a suit often enough to be worth a face,
+/// and none of those are in the bundled fonts.
+const SYMBOLS: &[&str] = &[
+    "notosanssymbols2",
+    "notosanssymbols",
+    "symbola",
+    "dejavusans",
+    "freeserif",
+];
+
+/// File name fragments of fonts that carry Hebrew letters, best first.
+const HEBREW: &[&str] = &[
+    "notosanshebrew",
+    "notoserifhebrew",
+    "culmus",
+    "frankruehl",
+    "davidclm",
+    "freeserif",
+    "dejavusans",
+];
+
+/// File name fragments of fonts that carry Thai letters, best first.
+const THAI: &[&str] = &[
+    "notosansthai",
+    "notoserifthai",
+    "garuda",
+    "loma",
+    "norasi",
+    "waree",
+    "kinnari",
+    "sarabun",
+    "tlwg",
+    "freeserif",
+];
+
+/// File name fragments of fonts that carry Devanagari letters, best first.
+const DEVANAGARI: &[&str] = &[
+    "notosansdevanagari",
+    "notoserifdevanagari",
+    "lohitdevanagari",
+    "sahadeva",
+    "gargi",
+    "nakula",
+    "freeserif",
+];
+
+/// File name fragments of fonts that carry Bengali letters, best first.
+const BENGALI: &[&str] = &[
+    "notosansbengali",
+    "notoserifbengali",
+    "lohitbengali",
+    "mukti",
+    "freeserif",
+];
+
+/// File name fragments of fonts that carry Gurmukhi letters, best first.
+const GURMUKHI: &[&str] = &["notosansgurmukhi", "lohitgurmukhi", "gurbani", "freeserif"];
+
+/// File name fragments of fonts that carry Gujarati letters, best first.
+const GUJARATI: &[&str] = &[
+    "notosansgujarati",
+    "notoserifgujarati",
+    "lohitgujarati",
+    "freeserif",
+];
+
+/// File name fragments of fonts that carry Tamil letters, best first.
+const TAMIL: &[&str] = &["notosanstamil", "notoseriftamil", "lohittamil", "freeserif"];
+
+/// File name fragments of fonts that carry Telugu letters, best first.
+const TELUGU: &[&str] = &["notosanstelugu", "lohittelugu", "gautami", "freeserif"];
+
+/// File name fragments of fonts that carry Kannada letters, best first.
+const KANNADA: &[&str] = &["notosanskannada", "lohitkannada", "tunga", "freeserif"];
+
+/// File name fragments of fonts that carry Malayalam letters, best first.
+const MALAYALAM: &[&str] = &[
+    "notosansmalayalam",
+    "lohitmalayalam",
+    "rachana",
+    "meera",
+    "anjali",
+    "freeserif",
+];
+
+/// File name fragments of fonts that carry Sinhala letters, best first.
+const SINHALA: &[&str] = &["notosanssinhala", "lklug", "iskoola"];
+
+/// File name fragments of fonts that carry Khmer letters, best first.
+const KHMER: &[&str] = &["notosanskhmer", "khmeros"];
+
+/// File name fragments of fonts that carry Lao letters, best first.
+const LAO: &[&str] = &["notosanslao", "phetsarath", "dokchampa"];
+
+/// File name fragments of fonts that carry Burmese letters, best first.
+const MYANMAR: &[&str] = &["notosansmyanmar", "myanmar3", "padauk"];
+
+/// File name fragments of fonts that carry Ethiopic letters, best first.
+const ETHIOPIC: &[&str] = &["notosansethiopic", "abyssinal"];
+
+/// File name fragments of fonts that carry Armenian letters, best first.
+const ARMENIAN: &[&str] = &["notosansarmenian", "freesans", "dejavusans"];
+
+/// File name fragments of fonts that carry Georgian letters, best first.
+const GEORGIAN: &[&str] = &["notosansgeorgian", "freesans", "dejavusans"];
+
+/// One entry per script the bundled faces cannot draw, each the file name
 /// fragments of the fonts that carry it.
-const SCRIPTS: &[&[&str]] = &[CJK, ARABIC];
+///
+/// The order is the order a glyph is looked for in, so the faces that fill the
+/// most gaps come first: a letter no bundled face has then comes from the
+/// first of these that carries it, and a glyph several carry from the one
+/// listed earliest. Each entry loads one font, and only for a script some
+/// library actually uses, so a system without those fonts pays nothing.
+const SCRIPTS: &[&[&str]] = &[
+    LATIN, SYMBOLS, CJK, ARABIC, HEBREW, THAI, DEVANAGARI, BENGALI, GURMUKHI, GUJARATI, TAMIL,
+    TELUGU, KANNADA, MALAYALAM, SINHALA, KHMER, LAO, MYANMAR, ETHIOPIC, ARMENIAN, GEORGIAN,
+];
 
 /// Font directories that XDG does not cover.
 ///
@@ -127,10 +270,26 @@ fn find() -> Vec<PathBuf> {
     for directory in directories() {
         collect(&directory, 0, &mut files);
     }
-    SCRIPTS
-        .iter()
-        .filter_map(|patterns| pick(&files, patterns))
-        .collect()
+    one_per_script(&files)
+}
+
+/// The best of `files` for each script, in the order [`SCRIPTS`] gives.
+///
+/// A face that serves more than one script answers for the first of them and
+/// is not taken again for the next: the same file loaded twice would keep its
+/// bytes in memory twice, and put the same glyphs in the chain twice, for no
+/// letter more than the one copy already draws.
+fn one_per_script(files: &[PathBuf]) -> Vec<PathBuf> {
+    let mut found: Vec<PathBuf> = Vec::new();
+    for patterns in SCRIPTS {
+        let Some(path) = pick(files, patterns) else {
+            continue;
+        };
+        if !found.contains(&path) {
+            found.push(path);
+        }
+    }
+    found
 }
 
 /// The font directories of the system and of the user.
@@ -318,22 +477,87 @@ mod tests {
             "/usr/share/fonts/noto/NotoSansCJK-Regular.ttc",
             "/usr/share/fonts/droid/DroidNaskh-Regular.ttf",
         ]);
-        let found: Vec<Option<PathBuf>> = SCRIPTS
-            .iter()
-            .map(|patterns| pick(&files, patterns))
-            .collect();
         assert_eq!(
-            found,
+            one_per_script(&files),
             [
-                Some(PathBuf::from(
-                    "/usr/share/fonts/noto/NotoSansCJK-Regular.ttc"
-                )),
-                Some(PathBuf::from(
-                    "/usr/share/fonts/droid/DroidNaskh-Regular.ttf"
-                )),
+                PathBuf::from("/usr/share/fonts/noto/NotoSansCJK-Regular.ttc"),
+                PathBuf::from("/usr/share/fonts/droid/DroidNaskh-Regular.ttf"),
             ],
             "one font per script, so a title in either draws"
         );
+    }
+
+    #[test]
+    fn a_face_that_serves_two_scripts_is_loaded_once() {
+        // A CJK face carries Latin too, so it answers for the Latin letters
+        // as well as the CJK ones. Reading it again for the second script
+        // would keep the same megabytes in memory twice.
+        let files = paths(&["/usr/share/fonts/noto/NotoSansCJK-Regular.ttc"]);
+        let found = one_per_script(&files);
+        assert_eq!(
+            found,
+            [PathBuf::from(
+                "/usr/share/fonts/noto/NotoSansCJK-Regular.ttc"
+            )],
+            "one file, however many scripts it draws"
+        );
+    }
+
+    #[test]
+    fn the_letters_the_bundled_face_leaves_out_get_a_font() {
+        // Ubuntu Light has the precomposed Latin Extended-A letters but none
+        // of Latin Extended Additional and no combining mark at all, so a
+        // Vietnamese title or one written as a letter and a mark needs a face
+        // of its own.
+        let files = paths(&[
+            "/usr/share/fonts/liberation/LiberationSans-Regular.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        ]);
+        assert_eq!(
+            pick(&files, LATIN),
+            Some(PathBuf::from(
+                "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
+            )),
+            "a face with the accents, not the one without"
+        );
+        let bare = paths(&["/usr/share/fonts/liberation/LiberationSans-Regular.ttf"]);
+        assert_eq!(
+            pick(&bare, LATIN),
+            None,
+            "a face that draws no more than the bundled one is no fallback"
+        );
+    }
+
+    #[test]
+    fn a_title_ending_in_a_note_gets_a_face() {
+        // No bundled face has the note, which a great many titles end in.
+        let files = paths(&[
+            "/usr/share/fonts/noto/NotoSansSymbols2-Regular.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        ]);
+        assert_eq!(
+            pick(&files, SYMBOLS),
+            Some(PathBuf::from(
+                "/usr/share/fonts/noto/NotoSansSymbols2-Regular.ttf"
+            )),
+            "the symbols face beats the catch-all one"
+        );
+    }
+
+    #[test]
+    fn a_font_with_hebrew_letters_is_found() {
+        let files = paths(&[
+            "/usr/share/fonts/liberation/LiberationSans-Regular.ttf",
+            "/usr/share/fonts/truetype/noto/NotoSansHebrew-Regular.ttf",
+        ]);
+        assert_eq!(
+            pick(&files, HEBREW),
+            Some(PathBuf::from(
+                "/usr/share/fonts/truetype/noto/NotoSansHebrew-Regular.ttf"
+            ))
+        );
+        let bare = paths(&["/usr/share/fonts/liberation/LiberationSans-Regular.ttf"]);
+        assert_eq!(pick(&bare, HEBREW), None, "no font here draws Hebrew");
     }
 
     #[test]
