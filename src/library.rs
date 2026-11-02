@@ -546,6 +546,9 @@ fn read_library_with(
     let mut tracks = Vec::new();
     let mut covers = Covers::default();
     let mut seen = 0;
+    // Files read from disk rather than from the cache, which is what says
+    // whether the cache on disk needs writing again.
+    let mut read = 0;
     let walk = WalkDir::new(root)
         .follow_links(true)
         .into_iter()
@@ -563,18 +566,32 @@ fn read_library_with(
         if let Some(track) = cached_track(&cache, entry.path(), &mut covers) {
             tracks.push(track);
         } else if let Some(track) = read_track(entry.path(), root, &mut covers) {
+            read += 1;
             tracks.push(track);
         }
     }
     progress(seen);
 
     let library = Library::from_tracks(tracks);
+    // A scan of a library nothing touched reads every entry from the cache and
+    // finds the files it lists, so the cache on disk already says what this
+    // scan would write. Skipping the write is what makes the scan the window
+    // runs every minute cost a `stat` per file rather than a rewrite of a file
+    // that can be megabytes. A file added, removed, renamed or retagged, and
+    // any picture stored again, shows up as a difference here.
+    let unchanged = read == 0
+        && !covers.failed
+        && cache
+            .as_ref()
+            .is_some_and(|cache| cache.all().len() == library.tracks.len());
     // A failed write only costs the next start its speed, so it is reported
     // and not treated as a failed scan. A write that failed while storing a
     // picture is skipped for the same reason, and because the entry would
     // record art that is not in the cache: the next start reads it again.
     let written = if covers.failed {
         Err("cannot store album art in the cache".to_string())
+    } else if unchanged {
+        Ok(())
     } else {
         crate::cache::save(&library, root)
     };
@@ -950,6 +967,54 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn a_scan_of_an_untouched_library_leaves_the_cache_as_it_is() {
+        // The scan the window runs every minute is worth running only if an
+        // untouched library costs a stat per file: writing a cache that says
+        // what it already says would rewrite a file of megabytes a minute.
+        let directory = Scratch::new("quiet-cache", 2);
+        read_library(&directory.0).expect("the directory scans");
+        let path = crate::cache::cache_path(&directory.0).expect("the cache is kept somewhere");
+        let marker = format!(
+            "{}\n# left by the first scan\n",
+            std::fs::read_to_string(&path).expect("the cache reads")
+        );
+        std::fs::write(&path, &marker).expect("the marker is written");
+
+        read_library(&directory.0).expect("the directory scans again");
+
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("the cache reads"),
+            marker,
+            "nothing changed, so the cache is left alone"
+        );
+    }
+
+    #[test]
+    fn a_scan_that_reads_a_file_writes_the_cache_again() {
+        let directory = Scratch::new("dirty-cache", 2);
+        read_library(&directory.0).expect("the directory scans");
+        let path = crate::cache::cache_path(&directory.0).expect("the cache is kept somewhere");
+        let marker = format!(
+            "{}\n# left by the first scan\n",
+            std::fs::read_to_string(&path).expect("the cache reads")
+        );
+        std::fs::write(&path, &marker).expect("the marker is written");
+        let added = directory.0.join("An Album").join("99.wav");
+        std::fs::File::create(&added)
+            .and_then(|mut file| file.write_all(&wav(1)))
+            .expect("the file is written");
+
+        read_library(&directory.0).expect("the directory scans again");
+
+        let written = std::fs::read_to_string(&path).expect("the cache reads");
+        assert!(
+            !written.contains("# left by the first scan"),
+            "a new file is in the cache, so the cache is written again"
+        );
+        assert!(written.contains("99"), "and the new file is in it");
     }
 
     #[test]

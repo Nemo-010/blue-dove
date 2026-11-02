@@ -209,6 +209,15 @@ fn file_name(root: &Path) -> String {
     format!("library-{hash:016x}.toml")
 }
 
+/// Where the cache for `root` is kept.
+///
+/// Only the tests ask: a scan writes the file itself, and what they check is
+/// whether a scan of an untouched library wrote it again.
+#[cfg(test)]
+pub(crate) fn cache_path(root: &Path) -> Option<PathBuf> {
+    Some(cache_dir()?.join(file_name(root)))
+}
+
 /// The directory the cache is kept in, when the platform has a cache directory.
 fn cache_dir() -> Option<PathBuf> {
     #[cfg(test)]
