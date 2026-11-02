@@ -15,13 +15,25 @@
 //! Events arrive on a thread of notify's own, one per file of a copy, so the
 //! window is only woken: it coalesces them into one scan once they stop.
 
+use std::cell::Cell;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver};
+use std::time::{Duration, Instant};
 
 use notify::event::{EventKind, ModifyKind, RemoveKind};
 use notify::{RecommendedWatcher, RecursiveMode, Watcher as _};
+
+/// How often the directory is looked for when nothing else says it went.
+///
+/// A watch that ended is not something every backend reports, or reports with
+/// the path the window named: Windows answers a deleted directory by dropping
+/// the watch without a word to the handler, and FSEvents names the path the
+/// kernel resolved, which a symbolic link in the path does not match. Asking
+/// the filesystem covers both, and one `stat` a second on the directory the
+/// library lives in costs nothing beside the scan that follows it.
+const CHECK_EVERY: Duration = Duration::from_secs(1);
 
 /// Called after an event, so the window draws and takes it in.
 pub type Waker = Arc<dyn Fn() + Send + Sync>;
@@ -34,18 +46,38 @@ pub struct Watch {
     _watcher: RecommendedWatcher,
     /// Events seen and not taken yet.
     events: Receiver<()>,
-    /// Whether the watch ended, which the kernel does not say twice.
+    /// Whether the watch ended, which the kernel may never say.
     ///
     /// A directory that is deleted, renamed or unmounted takes its watch with
     /// it, and nothing under that path is reported again: the window has to
     /// place a new one, and this is how it learns to.
     ended: Arc<AtomicBool>,
+    /// When the directory was last looked for, so that it is not on every
+    /// frame.
+    looked: Cell<Instant>,
 }
 
 impl Watch {
     /// Whether the watch on the directory ended, and a new one is needed.
+    ///
+    /// What the backend reported is taken first, and the directory itself is
+    /// looked for once a second for the backends that report nothing.
     pub fn ended(&self) -> bool {
-        self.ended.load(Ordering::Relaxed)
+        if self.ended.load(Ordering::Relaxed) {
+            return true;
+        }
+        let now = Instant::now();
+        if now.saturating_duration_since(self.looked.get()) < CHECK_EVERY {
+            return false;
+        }
+        self.looked.set(now);
+        // An error is not the directory going away: a permission that comes
+        // and goes still leaves it there to report changes under.
+        if !matches!(self.root.try_exists(), Ok(false)) {
+            return false;
+        }
+        self.ended.store(true, Ordering::Relaxed);
+        true
     }
     /// Whether anything under the directory changed since the last call.
     ///
@@ -77,15 +109,15 @@ pub fn spawn(directory: &Path, wake: Waker) -> Option<Watch> {
     let ended = Arc::new(AtomicBool::new(false));
     let ended_by_event = Arc::clone(&ended);
     let root = directory.to_path_buf();
+    let resolved = root.canonicalize().unwrap_or_else(|_| root.clone());
     let watched = root.clone();
+    let watched_resolved = resolved.clone();
     let mut watcher = notify::recommended_watcher(move |result: notify::Result<notify::Event>| {
-        let root = watched.clone();
-        let ended = Arc::clone(&ended_by_event);
         match result {
             // The directory itself going away ends the watch, and the kernel
             // says so once: a watch that is not replaced watches nothing.
-            Ok(event) if ends_the_watch(&event, &root) => {
-                ended.store(true, Ordering::Relaxed);
+            Ok(event) if ends_the_watch(&event, &watched, &watched_resolved) => {
+                ended_by_event.store(true, Ordering::Relaxed);
                 if sender.send(()).is_ok() {
                     wake();
                 }
@@ -100,7 +132,7 @@ pub fn spawn(directory: &Path, wake: Waker) -> Option<Watch> {
             // take in: the file it could not see arrives with the next full
             // scan, and the watch is placed again.
             Err(_) => {
-                ended.store(true, Ordering::Relaxed);
+                ended_by_event.store(true, Ordering::Relaxed);
                 if sender.send(()).is_ok() {
                     wake();
                 }
@@ -114,6 +146,7 @@ pub fn spawn(directory: &Path, wake: Waker) -> Option<Watch> {
         _watcher: watcher,
         events,
         ended,
+        looked: Cell::new(Instant::now()),
     })
 }
 
@@ -122,13 +155,16 @@ pub fn spawn(directory: &Path, wake: Waker) -> Option<Watch> {
 /// A watch is placed on the directory and on everything below it; the one on
 /// the directory ends when the directory is removed or renamed away, and the
 /// kernel reports that once. Anything else is a change to take in.
-fn ends_the_watch(event: &notify::Event, root: &Path) -> bool {
+fn ends_the_watch(event: &notify::Event, root: &Path, resolved: &Path) -> bool {
     let gone = matches!(
         event.kind,
         EventKind::Remove(RemoveKind::Folder | RemoveKind::Any)
             | EventKind::Modify(ModifyKind::Name(_))
     );
-    gone && event.paths.iter().any(|path| path == root)
+    gone && event
+        .paths
+        .iter()
+        .any(|path| path == root || path == resolved)
 }
 
 #[cfg(test)]
@@ -209,27 +245,69 @@ mod tests {
         // A watch on a directory that is removed or moved away watches
         // nothing, and the kernel says so once. The window reads this to
         // place a new one, since nothing under the old path is reported.
-        let root = Path::new("/music");
+        //
+        // The other names are the same directory: FSEvents reports the path
+        // the kernel resolved, which on macOS is what a watch placed through
+        // the `/var` symbolic link gets.
+        let root = Path::new("/var/music");
+        let resolved = Path::new("/private/var/music");
         let removed = notify::Event::new(EventKind::Remove(RemoveKind::Folder))
-            .add_path(PathBuf::from("/music"));
+            .add_path(PathBuf::from("/var/music"));
+        let removed_resolved = notify::Event::new(EventKind::Remove(RemoveKind::Folder))
+            .add_path(PathBuf::from("/private/var/music"));
         let moved = notify::Event::new(EventKind::Modify(ModifyKind::Name(
             notify::event::RenameMode::From,
         )))
-        .add_path(PathBuf::from("/music"));
+        .add_path(PathBuf::from("/var/music"));
         let file = notify::Event::new(EventKind::Remove(RemoveKind::File))
-            .add_path(PathBuf::from("/music/song.wav"));
+            .add_path(PathBuf::from("/var/music/song.wav"));
         let written = notify::Event::new(EventKind::Modify(ModifyKind::Data(
             notify::event::DataChange::Any,
         )))
-        .add_path(PathBuf::from("/music/song.wav"));
+        .add_path(PathBuf::from("/var/music/song.wav"));
 
-        assert!(ends_the_watch(&removed, root), "the directory was removed");
-        assert!(ends_the_watch(&moved, root), "or renamed away");
         assert!(
-            !ends_the_watch(&file, root),
+            ends_the_watch(&removed, root, resolved),
+            "the directory was removed"
+        );
+        assert!(
+            ends_the_watch(&removed_resolved, root, resolved),
+            "or removed, named the way the kernel resolves it"
+        );
+        assert!(ends_the_watch(&moved, root, resolved), "or renamed away");
+        assert!(
+            !ends_the_watch(&file, root, resolved),
             "a file under it is a change, not the end of the watch"
         );
-        assert!(!ends_the_watch(&written, root), "and so is a write");
+        assert!(
+            !ends_the_watch(&written, root, resolved),
+            "and so is a write"
+        );
+    }
+
+    #[test]
+    fn a_directory_that_is_gone_ends_the_watch_unasked() {
+        // Windows ends the watch on a directory that is deleted without a
+        // word to the handler, so nothing arrives to say so: the directory is
+        // looked for instead, which is what this places no watch around.
+        let scratch = Scratch::new("gone");
+        let (_, events) = mpsc::channel();
+        let watch = Watch {
+            root: scratch.0.clone(),
+            _watcher: notify::recommended_watcher(|_| {}).expect("a watcher is made"),
+            events,
+            ended: Arc::new(AtomicBool::new(false)),
+            looked: Cell::new(Instant::now()),
+        };
+        assert!(!watch.ended(), "the directory is there to begin with");
+
+        std::fs::remove_dir_all(&scratch.0).expect("the directory goes");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !watch.ended() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        assert!(watch.ended(), "the directory is looked for, and found gone");
     }
 
     #[test]
