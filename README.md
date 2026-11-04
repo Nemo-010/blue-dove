@@ -4,7 +4,7 @@
 
 <h1 align="center">Blue Dove</h1>
 
-<p align="center">A fast simple music player with no bloat, album browser and a waveform seekbar, preview mode and multiple theme options</p>
+<p align="center">A fast simple music player with no bloat, album browser and a waveform seekbar, preview mode and multiple theme options.</p>
 
 <p align="center">
   <a href="https://pkgforge-apps.github.io/blue-dove/">Documentation</a> |
@@ -17,11 +17,11 @@ draws the waveform of the playing track so you can see where you are and
 jump anywhere in it.
 
 There is no library database to build, no account to sign in to, and no
-network access. It is one native Rust binary drawn with egui, and there is no
-GStreamer underneath it: every decoder is in the binary, so no codec package
+network access. It is one native Rust binary drawn with egui and **no
+GStreamer bloat**: every decoder is in the binary, so no codec package
 has to be installed for the formats it reads. It starts at once and stays
 small in memory, which is what makes it an alternative to heavyweight players
-such as Clementine, Strawberry and Elisa.
+such as Clementine or Strawberry.
 
 ## Features
 
