@@ -1,15 +1,21 @@
 # Using Blue Dove
 
-## Open a directory
+## Add the directories
 
-Pick **File > Open Music Directory**, or press `Ctrl+O`. The browser that
-opens walks your file system and needs nothing installed besides Blue Dove
-itself.
+Pick **File > Manage Library Sources**, or press `Ctrl+O`, and add a directory
+to the list. The browser that opens walks your file system and needs nothing
+installed besides Blue Dove itself.
 
-Blue Dove scans the directory and everything under it, reads the tags of every
-audio file it finds, and groups them into albums by album artist, album
-and year. Directories it cannot read are skipped; a file whose tags cannot
-be read is still listed under its file name.
+Every directory on the list is scanned, and so is everything under it. Add as
+many as you like: the album list keeps each one in a part of its own. The same
+window leaves a directory out of the scan, with everything under it, without
+touching the files: point it at the Christmas music inside a library you listen
+to the rest of the year, and it stays where it is on disk and off the album
+list.
+
+Blue Dove reads the tags of every audio file it finds and groups them into
+albums by album artist, album and year. Directories it cannot read are skipped;
+a file whose tags cannot be read is still listed under its file name.
 
 Files and directories whose name starts with a dot are left out, which is
 what **View > Ignore hidden files** is for. It is on to begin with; turn
@@ -17,12 +23,12 @@ it off to list a music directory that keeps its files in a dotted
 directory. Either way the directory you picked is scanned, even if its own
 name starts with a dot. Changing the setting scans again.
 
-The directory is remembered, so the next start scans it again and shows the
-library at once. It is also watched while the window runs: a file added,
+The directories are remembered, so the next start scans them again and shows
+the library at once. They are also watched while the window runs: a file added,
 moved or retagged outside the window is scanned a few seconds later,
 without a rescan by hand. That is what **File > Scan Automatically** covers,
 and it is on to begin with; turn it off and the library is only read when you
-ask, with **File > Rescan Library** or by changing the music directory.
+ask, with **File > Rescan Library** or by changing the sources.
 
 Storage that cannot report changes, such as a network share, is scanned an
 hour after the last scan instead, and so is a directory with more
@@ -36,7 +42,7 @@ is renamed, written or retagged does.
 ## Find an album
 
 The menu bar and the library share the left-hand column: the menus sit
-at its top, and below them your music directory as a tree of directories,
+at its top, and below them your music as a tree of directories,
 with the albums inside them. Click the arrow beside a directory to fold
 it away.
 
@@ -46,10 +52,11 @@ under a directory named after it. A directory holding several albums keeps
 its row, with those albums listed beneath it. Files that carry no album
 tag appear as small rows under their directory.
 
-The albums and the untagged files that sit directly in your music
-directory have no directory row above them: they head the list, and the
-directories below follow. **Add All** in the Library header appends the
-whole library in that order, untagged files included.
+The albums and the untagged files that sit directly in one of your
+directories have no row above them: they head the list, and the
+directories below follow. Two sources or more each keep a row of their own,
+so their subdirectories never mingle. **Add All** in the Library header
+appends the whole library in that order, untagged files included.
 
 Click an album to select it. Double-click one to make it the playlist.
 Double-click a directory to append everything it holds: its albums in
@@ -74,7 +81,7 @@ from the cache. On a library of seven thousand tracks the first start
 takes about six seconds and later ones a fraction of a second.
 
 Deleting the cache directory is always safe; the next start scans the
-directory as if it were new.
+directories as if they were new.
 
 ## Playlists
 
@@ -418,7 +425,7 @@ since what it found belonged to the playlist that was showing.
 | `Ctrl+Left` / `Ctrl+Right` | Previous or next track |
 | `Ctrl+Up` / `Ctrl+Down` | Raise or lower the volume |
 | `Ctrl+F` or `/` | Search the playlist |
-| `Ctrl+O` | Open a music directory |
+| `Ctrl+O` | Manage the library sources |
 | `Delete` | Remove the selected rows from the playlist |
 | `Ctrl+A` | Select every row the table shows |
 
@@ -453,7 +460,8 @@ you would rather have a solid window on a busy wallpaper.
 
 ## Where settings live
 
-The music directory, the volume, the theme, the two playback modes, the
+The music directories, the ones left out of the scan, the volume, the theme,
+the two playback modes, the
 column widths and which columns are shown, the open playlists and their
 tabs, and the window options (translucent, keep playing when closed,
 ignore hidden files, scan automatically, fit or fill the album art) are kept
@@ -475,8 +483,8 @@ a desktop's media widget shows, and `waveforms/` the peak envelopes. Art is
 decoded behind the window rather than before it opens, so a library of
 thousands of tracks opens at once; every cover is queued when the library
 opens and decoded behind the window, so scrolling finds them ready, and the
-cover on screen is decoded ahead of that queue. The cache is named after the
-music directory with symlinks resolved, so a library reached through a link
-and the directory it points at share one entry. Deleting that directory is
+cover on screen is decoded ahead of that queue. Each music directory has a
+cache of its own, named after it with symlinks resolved, so a library reached
+through a link and the directory it points at share one entry. Deleting that directory is
 safe at any time, `covers/` included: the next scan finds the pictures gone
 and reads the files that name them again.

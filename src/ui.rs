@@ -2,12 +2,13 @@
 //!
 //! Every function here reads [`App`] state and turns input into calls on it.
 
+use std::path::PathBuf;
 use std::time::Duration;
 
 use eframe::egui::{self, Align2, Color32, FontId, Rect, Sense, Stroke, pos2, vec2};
 
 use crate::abx::{Abx, Choice, Side, TRIALS};
-use crate::app::{App, COMPACT_NAME_HEIGHT, COMPACT_WAVE_HEIGHT, ROW_HEIGHT, WAVE_HEIGHT};
+use crate::app::{App, COMPACT_NAME_HEIGHT, COMPACT_WAVE_HEIGHT, Pick, ROW_HEIGHT, WAVE_HEIGHT};
 use crate::format;
 use crate::library::{Album, Track};
 use crate::theme;
@@ -54,6 +55,12 @@ const SUM_CHARS: usize = 8;
 /// It is the room the longest state of the test needs: both tracks with their
 /// sums, the three play buttons, the trial, the answer row and the footer.
 const ABX_WINDOW_SIZE: [f32; 2] = [420.0, 292.0];
+
+/// Width the library sources window opens at, in points.
+///
+/// Wide enough for a path of a few directories, and fixed so the window does
+/// not grow around the deepest one the user has.
+const DIRECTORIES_WIDTH: f32 = 480.0;
 
 /// Characters a track's name may take before it is cut short, so that the
 /// sum beside it always fits.
@@ -473,6 +480,22 @@ fn column_starts(widths: [f32; 6]) -> [f32; 6] {
     starts
 }
 
+/// Draws one directory in the library sources window, with its button.
+///
+/// Answers whether the button was clicked. The path is cut short rather than
+/// wrapped, so a deep path does not make the window wider or the row taller
+/// than the ones around it.
+fn directory_line(ui: &mut egui::Ui, directory: &std::path::Path, button: &str) -> bool {
+    let mut clicked = false;
+    ui.horizontal(|ui| {
+        if ui.small_button(button).clicked() {
+            clicked = true;
+        }
+        ui.add(egui::Label::new(directory.display().to_string()).truncate());
+    });
+    clicked
+}
+
 /// The cell of `column` in a row, in `rect`'s coordinates.
 ///
 /// The length is pinned to the row's right edge rather than starting where
@@ -546,19 +569,17 @@ impl App {
         egui::Panel::top("menu").show(ui, |ui| {
             egui::MenuBar::new().ui(ui, |ui| {
                 ui.menu_button("File", |ui| {
-                    if ui.button("Open Music Directory...").clicked() {
+                    if ui.button("Manage Library Sources...").clicked() {
                         ui.close();
-                        self.ask_for_directory();
+                        self.directories_open = true;
                     }
-                    let directory = self.config.music_directory.clone();
+                    let scanned = !self.config.roots().is_empty();
                     if ui
-                        .add_enabled(directory.is_some(), egui::Button::new("Rescan Library"))
+                        .add_enabled(scanned, egui::Button::new("Rescan Library"))
                         .clicked()
                     {
                         ui.close();
-                        if let Some(directory) = directory {
-                            self.start_scan(directory);
-                        }
+                        self.start_scan();
                     }
                     self.setting_checkbox(
                         ui,
@@ -567,7 +588,7 @@ impl App {
                         Self::set_auto_scan,
                     )
                     .on_hover_text(
-                        "Watches the music directory and rescans it when a file \
+                        "Watches the music directories and rescans them when a file \
                          changes, so new files show up without a rescan",
                     );
                     ui.separator();
@@ -658,7 +679,7 @@ impl App {
 
                 ui.menu_button("Help", |ui| {
                     ui.label(format!("{} {}", Self::TITLE, env!("CARGO_PKG_VERSION")));
-                    ui.label("Plays the music in one directory.");
+                    ui.label("Plays the music in the directories you add.");
                     ui.hyperlink_to(
                         "Documentation",
                         "https://pkgforge-apps.github.io/blue-dove/",
@@ -678,6 +699,81 @@ impl App {
                 });
             });
         });
+    }
+
+    /// Draws the library sources window, when it is open.
+    ///
+    /// It lists the directories the library is read from and the ones the
+    /// scan leaves out, and is where both lists are edited: a source added,
+    /// removed, left out or put back is scanned again as soon as the window
+    /// lets go of it.
+    pub(crate) fn directories_window(&mut self, ctx: &egui::Context) {
+        if !self.directories_open {
+            return;
+        }
+        let roots: Vec<PathBuf> = self.config.roots().to_vec();
+        let excluded: Vec<PathBuf> = self.config.excluded().to_vec();
+        let mut open = self.directories_open;
+        let mut add = false;
+        let mut exclude = false;
+        let mut remove = None;
+        let mut include = None;
+
+        egui::Window::new("Library Sources")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .default_width(DIRECTORIES_WIDTH)
+            .show(ctx, |ui| {
+                ui.label("The library is read from these directories and everything below them.");
+                ui.add_space(4.0);
+                if roots.is_empty() {
+                    ui.weak("No directory yet.");
+                }
+                for (index, directory) in roots.iter().enumerate() {
+                    if directory_line(ui, directory, "Remove") {
+                        remove = Some(index);
+                    }
+                }
+                ui.add_space(4.0);
+                if ui.button("Add Directory...").clicked() {
+                    add = true;
+                }
+
+                ui.separator();
+                ui.label("Directories left out, with everything under them:");
+                ui.add_space(4.0);
+                if excluded.is_empty() {
+                    ui.weak("Nothing is left out.");
+                }
+                for (index, directory) in excluded.iter().enumerate() {
+                    if directory_line(ui, directory, "Scan Again") {
+                        include = Some(index);
+                    }
+                }
+                ui.add_space(4.0);
+                if ui.button("Exclude Directory...").clicked() {
+                    exclude = true;
+                }
+            });
+
+        self.directories_open = open;
+        if add {
+            self.ask_for_directory(Pick::Add);
+        }
+        if exclude {
+            self.ask_for_directory(Pick::Exclude);
+        }
+        if let Some(index) = remove
+            && let Some(directory) = roots.get(index)
+        {
+            self.remove_directory(directory);
+        }
+        if let Some(index) = include
+            && let Some(directory) = excluded.get(index)
+        {
+            self.include_directory(directory);
+        }
     }
 
     /// Draws the blind comparison, when one is under way.

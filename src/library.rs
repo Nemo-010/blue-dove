@@ -499,28 +499,56 @@ fn order(a: &Track, b: &Track) -> std::cmp::Ordering {
         .then_with(|| a.title.to_lowercase().cmp(&b.title.to_lowercase()))
 }
 
+/// The directories a scan reads, and the ones it leaves out.
+///
+/// A scan walks each of `roots` in turn and skips anything under `excluded`,
+/// so a directory the user has no use for in the album list stays where it is
+/// on disk.
+#[derive(Clone, Debug, Default)]
+pub struct Sources {
+    /// Directories to walk, in the order the album list shows them.
+    pub roots: Vec<PathBuf>,
+    /// Directories left out of the walk, with everything under them.
+    pub excluded: Vec<PathBuf>,
+    /// Whether files and directories whose name starts with a dot are left
+    /// out.
+    pub ignore_hidden: bool,
+}
+
 /// What a scan reports while it runs.
 pub enum ScanMessage {
     /// Files read so far, for the progress line.
     Progress(usize),
     /// The finished library.
     Done(Box<Library>),
-    /// The scan could not read the directory at all.
+    /// A directory could not be read, while another was: what it held is
+    /// missing from the library, and the rest is not.
+    Warning(String),
+    /// The scan could not read a directory at all.
     Failed(String),
 }
 
-/// Starts a scan of `root` on a thread and returns the channel it reports on.
+/// Starts a scan of `sources` on a thread and returns the channel it reports
+/// on.
 ///
-/// `ignore_hidden` leaves out files and directories whose name starts with a
-/// dot, which is where desktops keep their own bookkeeping and where a music
-/// directory sometimes holds a stash of files nobody wants in a playlist.
-pub fn spawn_scan(root: PathBuf, ignore_hidden: bool) -> Receiver<ScanMessage> {
+/// `sources.ignore_hidden` leaves out files and directories whose name starts
+/// with a dot, which is where desktops keep their own bookkeeping and where a
+/// music directory sometimes holds a stash of files nobody wants in a
+/// playlist.
+pub fn spawn_scan(sources: Sources) -> Receiver<ScanMessage> {
     let (sender, receiver) = mpsc::channel();
     thread::spawn(move || {
         let progress = sender.clone();
-        let result = read_library_with(&root, ignore_hidden, |files| {
-            let _ = progress.send(ScanMessage::Progress(files));
-        });
+        let warned = sender.clone();
+        let result = read_library_with(
+            &sources,
+            |files| {
+                let _ = progress.send(ScanMessage::Progress(files));
+            },
+            |error| {
+                let _ = warned.send(ScanMessage::Warning(error.to_string()));
+            },
+        );
         let message = match result {
             Ok(library) => ScanMessage::Done(Box::new(library)),
             Err(error) => ScanMessage::Failed(error),
@@ -535,26 +563,73 @@ pub fn spawn_scan(root: PathBuf, ignore_hidden: bool) -> Receiver<ScanMessage> {
 /// Hidden files are left out, which is what the app does by default.
 #[cfg(test)]
 pub fn read_library(root: &Path) -> Result<Library, String> {
-    read_library_with(root, true, |_| {})
+    read_library_with(&one(root, true), |_| {}, |_| {})
 }
 
 /// Reads every audio file under `root`, hidden ones included.
 #[cfg(test)]
 pub fn read_library_with_hidden(root: &Path) -> Result<Library, String> {
-    read_library_with(root, false, |_| {})
+    read_library_with(&one(root, false), |_| {}, |_| {})
 }
 
-/// Reads every audio file under `root`, calling `progress` as files pile up.
+/// A scan of one directory.
+#[cfg(test)]
+pub(crate) fn one(root: &Path, ignore_hidden: bool) -> Sources {
+    Sources {
+        roots: vec![root.to_path_buf()],
+        ignore_hidden,
+        ..Sources::default()
+    }
+}
+
+/// Reads every audio file under the music directories, calling `progress` as
+/// files pile up.
 ///
-/// A file the cache already describes, and that has not changed since, is
-/// taken from there instead of being read again. That is what keeps a start
-/// quick: the tags of a large directory are cheap, but decoding its album art
-/// is not, and the cache holds the decoded art.
+/// A directory that cannot be read does not stop the others: what it held is
+/// missing, and `warning` says which one it was. Only a scan that could read
+/// no directory at all fails.
 fn read_library_with(
-    root: &Path,
-    ignore_hidden: bool,
+    sources: &Sources,
     mut progress: impl FnMut(usize),
+    mut warning: impl FnMut(&str),
 ) -> Result<Library, String> {
+    if sources.roots.is_empty() {
+        return Err("no music directory is set".to_string());
+    }
+
+    let labels = labels(&sources.roots);
+    let mut parts = Vec::new();
+    let mut failure = None;
+    let mut seen = 0;
+    for (root, label) in sources.roots.iter().zip(labels) {
+        match read_root(root, sources, |files| progress(seen + files)) {
+            Ok(found) => {
+                seen += found.len();
+                parts.push((label, found));
+            }
+            Err(error) => {
+                warning(&error);
+                failure = Some(error);
+            }
+        }
+    }
+
+    if parts.is_empty() {
+        return Err(failure.unwrap_or_else(|| "no music found".to_string()));
+    }
+    Ok(merge(parts))
+}
+
+/// Reads every audio file under `root`, and writes that directory's cache.
+///
+/// The directories of the tracks it answers are relative to `root`, which is
+/// what the cache stores and what lets a directory be named another way
+/// between two runs.
+fn read_root(
+    root: &Path,
+    sources: &Sources,
+    mut progress: impl FnMut(usize),
+) -> Result<Vec<Track>, String> {
     if !root.is_dir() {
         return Err(format!("{} is not a directory", root.display()));
     }
@@ -566,12 +641,18 @@ fn read_library_with(
     // Files read from disk rather than from the cache, which is what says
     // whether the cache on disk needs writing again.
     let mut read = 0;
+    let excluded = excluded_under(root, &sources.excluded);
     let walk = WalkDir::new(root)
         .follow_links(true)
         .into_iter()
-        // The root itself is never hidden: a music directory may sit under a
-        // dotted directory and still be the one the user picked.
-        .filter_entry(|entry| !ignore_hidden || entry.path() == root || !is_hidden(entry.path()));
+        // The root itself is never hidden or excluded: a music directory may
+        // sit under a dotted directory and still be the one the user picked.
+        // What is under it follows both settings.
+        .filter_entry(|entry| {
+            entry.path() == root
+                || (!is_excluded(entry.path(), &excluded)
+                    && (!sources.ignore_hidden || !is_hidden(entry.path())))
+        });
     for entry in walk.flatten() {
         if !entry.file_type().is_file() || !has_audio_extension(entry.path()) {
             continue;
@@ -615,7 +696,82 @@ fn read_library_with(
     if let Err(error) = written {
         eprintln!("blue-dove: {error}");
     }
-    Ok(library)
+    Ok(library.tracks)
+}
+
+/// The names the music directories get in the album list, when there are
+/// several of them.
+///
+/// One directory is the library root and needs none: its subdirectories are
+/// the top-level rows. Several would all land in one tree, so each keeps its
+/// own name above the rest, and a name taken twice is numbered rather than
+/// merged with the other.
+fn labels(roots: &[PathBuf]) -> Vec<Option<String>> {
+    if roots.len() < 2 {
+        return vec![None; roots.len()];
+    }
+    let mut taken = HashSet::new();
+    roots
+        .iter()
+        .map(|root| {
+            let base = root
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map_or_else(|| root.display().to_string(), composed);
+            let mut label = base.clone();
+            let mut number = 2;
+            while !taken.insert(label.clone()) {
+                label = format!("{base} ({number})");
+                number += 1;
+            }
+            Some(label)
+        })
+        .collect()
+}
+
+/// Joins what each music directory held into one library.
+///
+/// A directory whose name is given keeps it as the first part of every path,
+/// so the album list shows it as a row of its own; one directory has no name,
+/// and its contents are the top level.
+fn merge(parts: Vec<(Option<String>, Vec<Track>)>) -> Library {
+    let mut tracks = Vec::new();
+    for (label, mut found) in parts {
+        if let Some(label) = label {
+            for track in &mut found {
+                track.directory = Path::new(&label).join(&track.directory);
+            }
+        }
+        tracks.extend(found);
+    }
+    Library::from_tracks(tracks)
+}
+
+/// The excluded paths as a walk under `root` names them.
+///
+/// A directory handed over the way the file dialog names it may be spelled
+/// other than the walk spells it: a link in the root's path, or `/tmp` and
+/// `/private/tmp` on macOS. What both sides resolve to is tried too, so an
+/// exclusion picked through a link still leaves the real directory out.
+fn excluded_under(root: &Path, excluded: &[PathBuf]) -> Vec<PathBuf> {
+    let resolved = root.canonicalize().ok();
+    excluded
+        .iter()
+        .filter_map(|directory| {
+            if let Ok(relative) = directory.strip_prefix(root) {
+                return Some(root.join(relative));
+            }
+            let resolved = resolved.as_ref()?;
+            let target = directory.canonicalize().ok()?;
+            let relative = target.strip_prefix(resolved).ok()?;
+            Some(root.join(relative))
+        })
+        .collect()
+}
+
+/// Whether `path` sits under a directory the scan leaves out.
+fn is_excluded(path: &Path, excluded: &[PathBuf]) -> bool {
+    excluded.iter().any(|directory| path.starts_with(directory))
 }
 
 /// The track the cache holds for `path`, when it still fits the file.
@@ -660,6 +816,24 @@ pub fn read_cache(root: &Path) -> Option<Library> {
         return None;
     }
     Some(Library::from_tracks(tracks))
+}
+
+/// Rebuilds the library of every music directory from its cache.
+///
+/// Answers `None` when no directory has a cache, which leaves the scan that
+/// runs behind the window to open the library.
+pub fn read_caches(sources: &Sources) -> Option<Library> {
+    let labels = labels(&sources.roots);
+    let mut parts = Vec::new();
+    for (root, label) in sources.roots.iter().zip(labels) {
+        if let Some(library) = read_cache(root) {
+            parts.push((label, library.tracks));
+        }
+    }
+    if parts.is_empty() {
+        return None;
+    }
+    Some(merge(parts))
 }
 
 /// Whether the last part of `path` starts with a dot.
@@ -1106,6 +1280,131 @@ mod tests {
 
         let library = read_library(&root).expect("the directory scans");
         assert_eq!(library.tracks.len(), 1);
+    }
+
+    #[test]
+    fn a_scan_of_several_directories_keeps_each_one_apart() {
+        // Two music directories both hold files sitting directly in them, and
+        // the pieces of a library that name them the same way would land in
+        // one tree. What says which directory a row belongs to is the source
+        // it came from.
+        let first = Scratch::new("sources-one", 1);
+        let second = Scratch::new("sources-two", 2);
+        let sources = Sources {
+            roots: vec![first.0.clone(), second.0.clone()],
+            ignore_hidden: true,
+            ..Sources::default()
+        };
+
+        let library = read_library_with(&sources, |_| {}, |_| {}).expect("both directories scan");
+
+        let shown: Vec<&str> = library
+            .directories()
+            .iter()
+            .map(|directory| directory.name.as_str())
+            .collect();
+        let named: Vec<String> = [&first.0, &second.0]
+            .iter()
+            .map(|root| {
+                root.file_name()
+                    .expect("a scratch directory has a name")
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        assert_eq!(
+            shown, named,
+            "each source heads its own part of the album list"
+        );
+        assert_eq!(library.tracks.len(), 3, "and every source is read");
+        let albums: Vec<usize> = library
+            .directories()
+            .iter()
+            .map(|directory| directory.albums.len() + directory.children.len())
+            .collect();
+        assert_eq!(albums, [1, 1], "each source keeps the album it holds");
+    }
+
+    #[test]
+    fn a_directory_left_out_of_the_scan_is_not_read() {
+        let directory = Scratch::new("excluded", 2);
+        let left_out = directory.0.join("Left Out");
+        std::fs::create_dir_all(&left_out).expect("the directory is made");
+        for name in ["one.wav", "two.wav"] {
+            std::fs::File::create(left_out.join(name))
+                .and_then(|mut file| file.write_all(&wav(1)))
+                .expect("the file is written");
+        }
+        let sources = Sources {
+            roots: vec![directory.0.clone()],
+            excluded: vec![left_out],
+            ignore_hidden: true,
+        };
+
+        let library = read_library_with(&sources, |_| {}, |_| {}).expect("the directory scans");
+
+        assert_eq!(
+            library.tracks.len(),
+            2,
+            "only the album beside it is listed"
+        );
+        assert!(
+            library.directory(Path::new("Left Out")).is_none(),
+            "and the directory left out has no row at all"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_directory_left_out_is_left_out_however_it_is_spelled() {
+        // The file dialog names a directory the way the desktop spells it,
+        // which is not always the way the walk under a linked root does:
+        // what both resolve to is what decides.
+        let directory = Scratch::new("excluded-spelling", 0);
+        let real = directory.0.join("real");
+        let left_out = real.join("Left Out");
+        std::fs::create_dir_all(&left_out).expect("the directory is made");
+        std::fs::File::create(left_out.join("song.wav"))
+            .and_then(|mut file| file.write_all(&wav(1)))
+            .expect("the file is written");
+        let link = directory.0.join("link");
+        std::os::unix::fs::symlink(&real, &link).expect("the link is made");
+        let sources = Sources {
+            roots: vec![link],
+            excluded: vec![left_out],
+            ignore_hidden: true,
+        };
+
+        let library = read_library_with(&sources, |_| {}, |_| {}).expect("the directory scans");
+
+        assert!(library.is_empty(), "the linked path finds the exclusion");
+    }
+
+    #[test]
+    fn a_directory_that_cannot_be_read_does_not_lose_the_others() {
+        let directory = Scratch::new("one-missing", 2);
+        let missing = directory.0.join("not there");
+        let sources = Sources {
+            roots: vec![missing, directory.0.clone()],
+            ignore_hidden: true,
+            ..Sources::default()
+        };
+        let mut warnings = Vec::new();
+
+        let library = read_library_with(&sources, |_| {}, |error| warnings.push(error.to_string()))
+            .expect("the directory that is there is read");
+
+        assert_eq!(library.tracks.len(), 2, "what is there is listed");
+        assert_eq!(warnings.len(), 1, "and the one that is not says so");
+        assert!(warnings[0].contains("not a directory"));
+    }
+
+    #[test]
+    fn a_scan_with_no_directory_at_all_fails() {
+        let error = read_library_with(&Sources::default(), |_| {}, |_| {})
+            .err()
+            .expect("there is nothing to scan");
+        assert!(error.contains("no music directory"), "{error}");
     }
 
     #[test]
