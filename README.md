@@ -84,8 +84,6 @@ such as Clementine or Strawberry.
 
 ### The desktop
 
-- Answers MPRIS over D-Bus, so `playerctl` and the desktop's media keys
-  control it. Without a session bus it still runs, just without them.
 - Keeps playing when the window is closed, if asked to, and comes back when
   launched again rather than opening a second player. Neither needs D-Bus.
 - Opens one file from a file manager as a small preview player, leaving the
@@ -93,6 +91,8 @@ such as Clementine or Strawberry.
 - Takes a file to play or a directory to queue from the command line, and
   the transport flags (`--play`, `--next` and the rest) against a player
   that is already running, so it can drive from a script or a keybinding.
+- Answers MPRIS over D-Bus, so `playerctl` and the desktop's media keys
+  control it. Without a session bus it still runs, just without them.
 
 ## Install
 
