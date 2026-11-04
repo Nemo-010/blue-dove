@@ -2,8 +2,8 @@
 layout: page
 sidebar: false
 titleTemplate: false
-tagline: A fast music player with an album browser and waveform seekbar
-lead: Point it at a directory and it plays. Native Rust, no database to build, no account, no network.
+tagline: A fast simple music player with no bloat, album browser and a waveform seekbar, preview mode and multiple theme options
+lead: Point it at a directory and it plays. Native Rust, no database to build, no account, no network, no GStreamer.
 features:
   - title: Point it at a directory
     body: Blue Dove reads the tags already in your files and groups them into albums. Nothing is imported or copied, so the directory stays the truth.

@@ -4,80 +4,95 @@
 
 <h1 align="center">Blue Dove</h1>
 
-<p align="center">A fast music player with an album browser and waveform seekbar</p>
+<p align="center">A fast simple music player with no bloat, album browser and a waveform seekbar, preview mode and multiple theme options.</p>
 
 <p align="center">
   <a href="https://pkgforge-apps.github.io/blue-dove/">Documentation</a> |
   <a href="https://github.com/pkgforge-apps/blue-dove/releases/latest">Latest release</a>
 </p>
 
-Blue Dove plays the music in the directories you point it at and nothing
+Blue Dove plays the music in the directories you point it at, and nothing
 else. It reads the tags already in your files, groups them into albums, and
-draws the waveform
-of the playing track so you can see where you are and jump anywhere in
-it. There is no library database to build, no service to sign in to,
-and no network access.
+draws the waveform of the playing track so you can see where you are and
+jump anywhere in it.
 
-It is a native Rust binary drawn with egui, so it starts at once and
-stays small in memory. It is an alternative to heavyweight players such
-as Clementine, Strawberry and Elisa.
+There is no library database to build, no account to sign in to, and no
+network access. It is one native Rust binary drawn with egui and **no
+GStreamer bloat**: every decoder is in the binary, so no codec package
+has to be installed for the formats it reads. It starts at once and stays
+small in memory, which is what makes it an alternative to heavyweight players
+such as Clementine or Strawberry.
 
 ## Features
 
-- Draws Japanese, Chinese and Korean titles, using a system CJK font
-  when one is installed.
-- Reads FLAC, MP3, M4A and ALAC, AAC, Ogg Vorbis, Opus, WAV, AIFF,
-  CAF, Matroska audio, Monkey's Audio, WavPack, TTA, Musepack and
-  Shorten, with their tags. Every decoder is pure Rust and compiled
-  into the binary, so nothing has to be installed to play them.
-- Plays the formats video game rips use: Sony VAG, CRI ADX, and
-  Nintendo DSP, BRSTM, BCSTM and BFSTM.
-- Repeats the playing track, or shuffles the playlist and plays it in
-  that order.
-- Browses your directory as a collapsible tree of directories and albums.
-- Groups tracks into albums by album artist, album and year, and plays
-  them in disc and track order.
+### Your library
+
+- Reads FLAC, MP3, M4A and ALAC, AAC, Ogg Vorbis, Opus, WAV, AIFF, CAF,
+  Matroska audio, Monkey's Audio, WavPack, TTA, Musepack, Shorten and AMR,
+  with their tags. Every decoder is pure Rust and compiled into the binary,
+  so nothing has to be installed to play them.
+- Plays the formats video game rips use: Sony VAG, CRI ADX, and Nintendo
+  DSP, BRSTM, BCSTM and BFSTM.
+- Groups tracks into albums by album artist, album and year, and plays them
+  in disc and track order.
+- Browses the music as a collapsible tree of directories and albums. A
+  directory that holds a single album is not shown above it, so a release
+  is never buried under a directory of the same name.
+- Reads several directories as one library, each kept in a part of the album
+  list of its own, and leaves a directory out of the scan without moving a
+  file. **File > Manage Library Sources** is where both lists are edited.
+- Shows album art, embedded or from an image beside the tracks, a `covers`
+  or `scans` directory, or the directory above a disc directory. A right
+  click on the art fills its square or fits the whole picture, for art that
+  is not square.
+- Leaves hidden files and directories out of the library unless asked to
+  include them.
+- Draws Japanese, Chinese and Korean titles, using a system CJK font when
+  one is installed.
+- Caches the tags and the album art as it found it, so a start on a large
+  library opens at once and only the files that changed are read again.
+
+### Playing
+
+- Draws the waveform of the playing track across the width of the window,
+  and seeks anywhere in it by clicking or dragging, forwards or backwards.
 - Keeps several playlists open as tabs, each with its own name, and heads
   each album in a playlist with its cover and year.
-- Shows album art, embedded or from an image beside the tracks, a
-  `covers` or `scans` directory, or the directory above a disc directory.
-  A right click on the art fills its square or fits the whole picture,
-  for art that is not square.
-- Draws the waveform of the playing track across the width of the
-  window, and seeks anywhere in it by clicking or dragging, forwards or
-  backwards.
-- Selects several tracks at once, plays just those, and removes them
-  from the playlist with the Delete key. Removing never touches the
-  files.
-- Searches the tracks of an album as you type, and leaves hidden files
-  out of the library unless asked to include them.
-- Resizes the track columns by dragging their borders, and shrinks them
-  to fit before the table ever scrolls sideways. A right click on the
-  column titles turns any column off, number included, and can show each
-  file's name beside its tagged title.
-- Adjusts the volume by dragging the slider or rolling the wheel over it.
-- Reads several directories as one library, each kept in its own part of the
-  album list, and leaves any directory out of the scan without moving it.
-- Remembers the music directories, the volume, the window opacity and every
-  open playlist between runs, so the next start shows the same tabs.
-- Caches the tags and the album art as it found it, so a start on a large
-  library opens at once and only re-reads the files that changed.
+- Repeats the playing track, or shuffles the playlist and plays it in that
+  order.
+- Selects several tracks at once, plays just those, and removes them from
+  the playlist with the Delete key. Removing never touches the files.
+- Searches the playlist as you type, and walks the matches with Enter.
+- Compares two encodes of the same track blind: ten trials, a signed log of
+  the result, and the sums of the files to tell them apart.
 - Shrinks into a compact popup of just the art, the controls and a thin
   waveform, for keeping in a corner while you work.
-- Answers MPRIS over D-Bus, so `playerctl` and the desktop's media keys
-  control it. Without a session bus it still runs, just without them.
-- Keeps playing when the window is closed, if asked to, and comes back
-  when launched again rather than opening a second player. Neither needs
-  D-Bus.
-- Draws a translucent window, so the desktop shows through it, when a
-  compositor is running.
+
+### The window
+
+- Resizes the track columns by dragging their borders, and shrinks them to
+  fit before the table ever scrolls sideways. A right click on the column
+  titles turns any column off, number included, and can show each file's
+  name beside its tagged title.
+- Adjusts the volume by dragging the slider or rolling the wheel over it,
+  and remembers the volume, the window opacity and every open playlist
+  between runs.
 - Ships five themes: its own, plus light and dark versions of Adwaita and
   Breeze, so it sits next to GTK and Qt programs.
-- Opens a directory with its own browser, so it needs no portal or file
-  dialog backend.
-- Plays a file or queues a directory from the command line, and takes
-  `--play`, `--next` and the rest against a player that is already running,
-  so it can drive from a script or a keybinding.
+- Draws a translucent window, so the desktop shows through it, when a
+  compositor is running.
+
+### The desktop
+
+- Keeps playing when the window is closed, if asked to, and comes back when
+  launched again rather than opening a second player. Neither needs D-Bus.
+- Opens one file from a file manager as a small preview player, leaving the
+  playlists alone.
+- Takes a file to play or a directory to queue from the command line, and
+  the transport flags (`--play`, `--next` and the rest) against a player
+  that is already running, so it can drive from a script or a keybinding.
+- Answers MPRIS over D-Bus, so `playerctl` and the desktop's media keys
+  control it. Without a session bus it still runs, just without them.
 
 ## Install
 
