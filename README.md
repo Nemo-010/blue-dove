@@ -11,8 +11,9 @@
   <a href="https://github.com/pkgforge-apps/blue-dove/releases/latest">Latest release</a>
 </p>
 
-Blue Dove plays the music in one directory and nothing else. It reads the tags
-already in your files, groups them into albums, and draws the waveform
+Blue Dove plays the music in the directories you point it at and nothing
+else. It reads the tags already in your files, groups them into albums, and
+draws the waveform
 of the playing track so you can see where you are and jump anywhere in
 it. There is no library database to build, no service to sign in to,
 and no network access.
@@ -55,7 +56,9 @@ as Clementine, Strawberry and Elisa.
   column titles turns any column off, number included, and can show each
   file's name beside its tagged title.
 - Adjusts the volume by dragging the slider or rolling the wheel over it.
-- Remembers the music directory, the volume, the window opacity and every
+- Reads several directories as one library, each kept in its own part of the
+  album list, and leaves any directory out of the scan without moving it.
+- Remembers the music directories, the volume, the window opacity and every
   open playlist between runs, so the next start shows the same tabs.
 - Caches the tags and the album art as it found it, so a start on a large
   library opens at once and only re-reads the files that changed.

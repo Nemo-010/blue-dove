@@ -84,6 +84,15 @@ pub const COMPACT_BREAK: [f32; 2] = [560.0, 430.0];
 /// naming the track, the controls and the waveform.
 pub const PREVIEW_NO_ART_SIZE: [f32; 2] = [320.0, 92.0];
 
+/// What the directory dialog was opened to pick.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Pick {
+    /// A directory to add to the library.
+    Add,
+    /// A directory the scan leaves out.
+    Exclude,
+}
+
 /// The MPRIS track id a preview answers with.
 ///
 /// A previewed file is in no playlist, so it has no index to be named by; a
@@ -306,8 +315,10 @@ pub struct App {
     random_state: u64,
     /// Message shown below the toolbar, such as an error.
     pub(crate) status: Option<String>,
-    /// Directory dialog in flight, while it is open.
-    pub(crate) picker: Option<Receiver<Option<PathBuf>>>,
+    /// Directory dialog in flight, and what it is picking for.
+    pub(crate) picker: Option<(Pick, Receiver<Option<PathBuf>>)>,
+    /// Whether the window listing the music directories is open.
+    pub(crate) directories_open: bool,
     /// What the window is showing.
     pub(crate) view: View,
     /// Requests from launches that found this window running, drained once a
@@ -319,8 +330,8 @@ pub struct App {
     pub(crate) background: bool,
     /// Whether the scan leaves out files and directories starting with a dot.
     pub(crate) ignore_hidden: bool,
-    /// Whether the music directory is scanned at startup and while the window
-    /// runs, so a file added outside the window shows up on its own.
+    /// Whether the music directories are scanned at startup and while the
+    /// window runs, so a file added outside the window shows up on its own.
     pub(crate) auto_scan: bool,
     /// When a scan last ended, for the fallback the timer runs.
     ///
@@ -333,13 +344,15 @@ pub struct App {
     /// A change arrives per file, so the scan waits for the burst to end; a
     /// further change pushes the wait back rather than adding a scan.
     pub(crate) scan_after: Option<Instant>,
-    /// The watch on the music directory, when it can be watched.
-    pub(crate) watch: Option<crate::watch::Watch>,
-    /// The directory a watch could not be started on, and when it was tried.
+    /// The watches on the music directories, one per directory that can be
+    /// watched.
+    pub(crate) watches: Vec<crate::watch::Watch>,
+    /// The directories a watch could not be started on, and when it was
+    /// tried.
     ///
     /// Retrying a tree the kernel has no watcher left for would fail on every
     /// frame, so a directory that refused waits a minute before the next go.
-    pub(crate) watch_failed: Option<(PathBuf, Instant)>,
+    pub(crate) watch_failed: Vec<(PathBuf, Instant)>,
     /// Whether the scan in flight was started by the timer rather than by the
     /// user.
     ///
@@ -483,6 +496,7 @@ impl App {
             random_state: 0x9e37_79b9_7f4a_7c15,
             status: None,
             picker: None,
+            directories_open: false,
             view: View::default(),
             requests: None,
             pending_paths: (!paths.is_empty()).then_some(paths),
@@ -491,8 +505,8 @@ impl App {
             auto_scan,
             scanned_at: None,
             scan_after: None,
-            watch: None,
-            watch_failed: None,
+            watches: Vec::new(),
+            watch_failed: Vec::new(),
             scan_quiet: false,
             cover_fit,
             preview_enabled,
@@ -504,50 +518,43 @@ impl App {
             abx_sums: None,
             abx_start: Duration::ZERO,
         };
-        match app.config.music_directory.clone() {
-            Some(directory) => {
-                // The last scan is shown at once, so the window opens with
-                // its albums and playlists in place; the scan that follows
-                // picks up whatever changed.
-                let cached = if !smoke {
-                    match crate::library::read_cache(&directory) {
-                        Some(library) => {
-                            app.adopt_library(library);
-                            true
-                        }
-                        None => false,
-                    }
-                } else {
-                    false
-                };
-                // The scan at startup is one of the two the automatic scan
-                // covers. A directory the cache knows nothing about is
-                // scanned anyway: an empty window would leave nothing to play,
-                // and the next start would learn nothing about the directory.
-                if app.auto_scan || !cached {
-                    app.start_scan(directory);
-                }
+        let sources = app.sources();
+        if sources.roots.is_empty() {
+            // A path on the command line says where the music is, which is a
+            // better answer for a first run than a dialog nobody asked for.
+            let named = app
+                .pending_paths
+                .as_ref()
+                .and_then(|paths| paths.first())
+                .and_then(|path| crate::cli::music_root(path));
+            match named {
+                Some(directory) if !smoke => app.add_directory(directory),
+                // A first run has nothing to show, so ask for a directory
+                // rather than leave an empty window.
+                _ if !smoke => app.ask_for_directory(Pick::Add),
+                _ => {}
             }
-            None => {
-                // A path on the command line says where the music is, which
-                // is a better answer for a first run than a dialog nobody
-                // asked for.
-                let named = app
-                    .pending_paths
-                    .as_ref()
-                    .and_then(|paths| paths.first())
-                    .and_then(|path| crate::cli::music_root(path));
-                match named {
-                    Some(directory) if !smoke => {
-                        app.config.music_directory = Some(directory.clone());
-                        app.save_settings();
-                        app.start_scan(directory);
+        } else {
+            // The last scan is shown at once, so the window opens with its
+            // albums and playlists in place; the scan that follows picks up
+            // whatever changed.
+            let cached = if !smoke {
+                match crate::library::read_caches(&sources) {
+                    Some(library) => {
+                        app.adopt_library(library);
+                        true
                     }
-                    // A first run has nothing to show, so ask for a directory
-                    // rather than leave an empty window.
-                    _ if !smoke => app.ask_for_directory(),
-                    _ => {}
+                    None => false,
                 }
+            } else {
+                false
+            };
+            // The scan at startup is one of the two the automatic scan
+            // covers. A directory the cache knows nothing about is scanned
+            // anyway: an empty window would leave nothing to play, and the
+            // next start would learn nothing about the directory.
+            if app.auto_scan || !cached {
+                app.start_scan();
             }
         }
         app.open_pending_paths(ctx);
@@ -843,41 +850,52 @@ impl App {
             .collect()
     }
 
-    /// Opens the desktop's directory dialog.
-    pub fn ask_for_directory(&mut self) {
+    /// Opens the desktop's directory dialog for `pick`.
+    pub fn ask_for_directory(&mut self, pick: Pick) {
         if self.picker.is_none() {
-            self.picker = Some(dialog::spawn(self.start_directory()));
+            self.picker = Some((pick, dialog::spawn(self.start_directory())));
         }
     }
 
-    /// Where the directory dialog starts: the saved directory, else the
-    /// user's music directory.
+    /// Where the directory dialog starts: the first music directory that is
+    /// still there, else the user's music directory.
     pub fn start_directory(&self) -> PathBuf {
         self.config
-            .music_directory
-            .clone()
-            .filter(|directory| directory.is_dir())
+            .roots()
+            .iter()
+            .find(|directory| directory.is_dir())
+            .cloned()
             .or_else(dirs::audio_dir)
             .or_else(dirs::home_dir)
             .unwrap_or_default()
     }
 
-    /// Scans `directory`, replacing the library when the scan finishes.
-    pub fn start_scan(&mut self, directory: PathBuf) {
-        self.status = None;
-        self.scan_quiet = false;
-        self.scan = Some((crate::library::spawn_scan(directory, self.ignore_hidden), 0));
+    /// What a scan reads, as the settings stand now.
+    fn sources(&self) -> crate::library::Sources {
+        crate::library::Sources {
+            roots: self.config.roots().to_vec(),
+            excluded: self.config.excluded().to_vec(),
+            ignore_hidden: self.ignore_hidden,
+        }
     }
 
-    /// Scans `directory` on the timer's behalf, taking in only what changed.
+    /// Scans the music directories, replacing the library when it finishes.
+    pub fn start_scan(&mut self) {
+        self.status = None;
+        self.scan_quiet = false;
+        self.scan = Some((crate::library::spawn_scan(self.sources()), 0));
+    }
+
+    /// Scans the music directories on the timer's behalf, taking in only what
+    /// changed.
     ///
     /// It is the same scan as a rescan by hand, but its answer is read
     /// quietly: a scan that found nothing new answers a library the window
     /// already lists, and taking that in would rebuild it, put the album list
     /// back where it started and write the session file, for nothing.
-    fn start_quiet_scan(&mut self, directory: PathBuf) {
+    fn start_quiet_scan(&mut self) {
         self.scan_quiet = true;
-        self.scan = Some((crate::library::spawn_scan(directory, self.ignore_hidden), 0));
+        self.scan = Some((crate::library::spawn_scan(self.sources()), 0));
     }
 
     /// The files the scan has read so far, for the menu bar to count.
@@ -899,7 +917,7 @@ impl App {
     /// nothing at all. Nothing is scanned with a scan already running, with
     /// no directory to scan, or with the automatic scan turned off.
     fn scan_when_due(&mut self) {
-        if !self.auto_scan || self.scan.is_some() {
+        if !self.auto_scan || self.scan.is_some() || self.config.roots().is_empty() {
             return;
         }
         match self.scan_after {
@@ -910,10 +928,7 @@ impl App {
             None if matches!(self.scanned_at, Some(at) if at.elapsed() < SCAN_EVERY) => return,
             None => {}
         }
-        let Some(directory) = self.config.music_directory.clone() else {
-            return;
-        };
-        self.start_quiet_scan(directory);
+        self.start_quiet_scan();
     }
 
     /// How long until a scan is due.
@@ -922,7 +937,7 @@ impl App {
     /// no directory to scan, or a scan is already running, which says so in
     /// its own way.
     fn scan_due_in(&self) -> Option<Duration> {
-        if !self.auto_scan || self.scan.is_some() || self.config.music_directory.is_none() {
+        if !self.auto_scan || self.scan.is_some() || self.config.roots().is_empty() {
             return None;
         }
         Some(match (self.scan_after, self.scanned_at) {
@@ -932,64 +947,107 @@ impl App {
         })
     }
 
-    /// Watches the music directory, or stops watching the one it watched.
+    /// Watches the music directories, and stops watching the ones it did.
     ///
     /// Called once a frame and cheap when there is nothing to do: it starts a
-    /// watch when one is wanted and none is running on the directory the
-    /// library is read from, and drops it when the automatic scan is turned
-    /// off or the directory changes.
-    fn watch_directory(&mut self, ctx: &egui::Context) {
-        let wanted = self
-            .auto_scan
-            .then(|| self.config.music_directory.clone())
-            .flatten();
-        let Some(directory) = wanted else {
-            self.watch = None;
-            return;
+    /// watch on every directory the library is read from, and drops the ones
+    /// the automatic scan was turned off for or that are no longer scanned.
+    ///
+    /// A watch that ended -- the directory was removed, renamed or unmounted
+    /// -- is dropped and placed again rather than kept: it reports nothing
+    /// from here on, and the path still matching would hide that.
+    fn watch_directories(&mut self, ctx: &egui::Context) {
+        let wanted: Vec<PathBuf> = if self.auto_scan {
+            self.config.roots().to_vec()
+        } else {
+            Vec::new()
         };
-        if let Some(watch) = &self.watch {
-            // A watch that ended -- the directory was removed, renamed or
-            // unmounted -- is replaced rather than kept: it reports nothing
-            // from here on, and the path still matching would hide that.
-            if watch.root() == directory && !watch.ended() {
-                return;
+        self.watches
+            .retain(|watch| wanted.iter().any(|root| root == watch.root()) && !watch.ended());
+        self.watch_failed
+            .retain(|(root, at)| wanted.contains(root) && at.elapsed() < WATCH_RETRY);
+        for directory in wanted {
+            if self.watches.iter().any(|watch| watch.root() == directory)
+                || self.watch_failed.iter().any(|(root, _)| *root == directory)
+            {
+                continue;
             }
-            self.watch = None;
-        }
-        if matches!(&self.watch_failed, Some((root, at)) if *root == directory && at.elapsed() < WATCH_RETRY)
-        {
-            return;
-        }
-        self.watch = None;
-        let ctx = ctx.clone();
-        let wake: crate::watch::Waker = std::sync::Arc::new(move || ctx.request_repaint());
-        match crate::watch::spawn(&directory, wake) {
-            Some(watch) => {
-                self.watch = Some(watch);
-                self.watch_failed = None;
+            let ctx = ctx.clone();
+            let wake: crate::watch::Waker = std::sync::Arc::new(move || ctx.request_repaint());
+            match crate::watch::spawn(&directory, wake) {
+                Some(watch) => self.watches.push(watch),
+                None => self.watch_failed.push((directory, Instant::now())),
             }
-            None => self.watch_failed = Some((directory, Instant::now())),
         }
     }
 
-    /// Opens a directory, remembers it and scans it.
-    pub fn open_directory(&mut self, directory: PathBuf) {
-        self.config.music_directory = Some(directory.clone());
+    /// Adds a directory to the library, remembers it and scans.
+    ///
+    /// A directory already in the library is scanned again rather than listed
+    /// twice.
+    pub fn add_directory(&mut self, directory: PathBuf) {
+        let mut roots = self.config.roots().to_vec();
+        if !roots.contains(&directory) {
+            roots.push(directory);
+            self.config.set_roots(roots);
+            self.save_settings();
+        }
+        self.start_scan();
+    }
+
+    /// Takes a directory out of the library, and scans again.
+    pub fn remove_directory(&mut self, directory: &Path) {
+        let roots: Vec<PathBuf> = self
+            .config
+            .roots()
+            .iter()
+            .filter(|root| root.as_path() != directory)
+            .cloned()
+            .collect();
+        self.config.set_roots(roots);
         self.save_settings();
-        self.start_scan(directory);
+        if self.config.roots().is_empty() {
+            // There is nothing left to scan, and blanking the album list under
+            // the user would take away the tracks they may have just queued.
+            self.scan = None;
+            self.status = None;
+            return;
+        }
+        self.start_scan();
+    }
+
+    /// Leaves a directory out of the scan, and scans again.
+    pub fn exclude_directory(&mut self, directory: PathBuf) {
+        let mut excluded = self.config.excluded().to_vec();
+        if !excluded.contains(&directory) {
+            excluded.push(directory);
+            self.config.set_excluded(excluded);
+            self.save_settings();
+        }
+        self.start_scan();
+    }
+
+    /// Puts a directory the scan left out back in it, and scans again.
+    pub fn include_directory(&mut self, directory: &Path) {
+        let excluded: Vec<PathBuf> = self
+            .config
+            .excluded()
+            .iter()
+            .filter(|left| left.as_path() != directory)
+            .cloned()
+            .collect();
+        self.config.set_excluded(excluded);
+        self.save_settings();
+        self.start_scan();
     }
 
     /// Takes in what the background threads have finished.
     fn poll_workers(&mut self, ctx: &egui::Context) {
-        // A change under the music directory is scanned once the burst that
+        // A change under the music directories is scanned once the burst that
         // caused it has ended, so a copy of an album is one scan rather than
         // one per file.
-        self.watch_directory(ctx);
-        if self
-            .watch
-            .as_ref()
-            .is_some_and(crate::watch::Watch::changed)
-        {
+        self.watch_directories(ctx);
+        if self.watches.iter().any(crate::watch::Watch::changed) {
             self.scan_after = Some(Instant::now() + SETTLE);
             ctx.request_repaint_after(SETTLE);
         }
@@ -1005,6 +1063,7 @@ impl App {
                         scanned = Some(library);
                         finished = true;
                     }
+                    ScanMessage::Warning(error) => self.status = Some(error),
                     ScanMessage::Failed(error) => {
                         self.status = Some(error);
                         failed = true;
@@ -1037,7 +1096,7 @@ impl App {
                 self.scanned_at = Some(Instant::now());
             }
             if self.library.is_empty() && self.status.is_none() {
-                self.status = Some("No music found in that directory".to_string());
+                self.status = Some("No music found in the library sources".to_string());
             }
         }
 
@@ -1061,12 +1120,16 @@ impl App {
             ctx.request_repaint();
         }
 
-        if let Some(receiver) = &self.picker
+        if let Some((pick, receiver)) = &self.picker
             && let Ok(chosen) = receiver.try_recv()
         {
+            let pick = *pick;
             self.picker = None;
             match chosen {
-                Some(directory) => self.open_directory(directory),
+                Some(directory) => match pick {
+                    Pick::Add => self.add_directory(directory),
+                    Pick::Exclude => self.exclude_directory(directory),
+                },
                 // A cancel and a missing backend are one answer; the message
                 // says which case this is when it can tell.
                 None => self.status = dialog::explain(),
@@ -2067,11 +2130,8 @@ impl App {
         self.auto_scan = auto_scan;
         self.config.auto_scan = Some(auto_scan);
         self.save_settings();
-        if auto_scan
-            && self.scan.is_none()
-            && let Some(directory) = self.config.music_directory.clone()
-        {
-            self.start_scan(directory);
+        if auto_scan && self.scan.is_none() && !self.config.roots().is_empty() {
+            self.start_scan();
         }
     }
 
@@ -2083,8 +2143,8 @@ impl App {
         self.ignore_hidden = ignore_hidden;
         self.config.ignore_hidden = Some(ignore_hidden);
         self.save_settings();
-        if let Some(directory) = self.config.music_directory.clone() {
-            self.start_scan(directory);
+        if !self.config.roots().is_empty() {
+            self.start_scan();
         }
     }
 
@@ -2799,7 +2859,7 @@ impl App {
             self.select_all();
         }
         if chord(ctx, egui::Modifiers::COMMAND, egui::Key::O) {
-            self.ask_for_directory();
+            self.directories_open = true;
         }
         if chord(ctx, egui::Modifiers::COMMAND, egui::Key::F) {
             self.open_search();
@@ -3098,6 +3158,7 @@ impl eframe::App for App {
         }
 
         self.abx_window(&ctx);
+        self.directories_window(&ctx);
 
         self.tick_smoke(&ctx);
     }
@@ -3704,7 +3765,10 @@ pub(crate) mod tests {
         let mut app = app_with(&[("One", &["A"])]);
         // A scan in flight is what the app holds while a library is read.
         let root = std::env::temp_dir();
-        app.scan = Some((crate::library::spawn_scan(root, true), 0));
+        app.scan = Some((
+            crate::library::spawn_scan(crate::library::one(&root, true)),
+            0,
+        ));
         assert!(app.scan.is_some(), "the scan is running");
 
         app.pending_paths = Some(vec![file.clone()]);
@@ -4633,7 +4697,7 @@ pub(crate) mod tests {
         // as a scan would leave the next one an hour off, on exactly the
         // storage the fallback is there for.
         let mut app = app_with(&[("One", &["A"])]);
-        app.config.music_directory = Some(std::env::temp_dir());
+        app.config.set_roots(vec![std::env::temp_dir()]);
         app.auto_scan = true;
         app.scanned_at = None;
         app.scan = Some((failed("that directory is not there"), 0));
@@ -4734,7 +4798,7 @@ pub(crate) mod tests {
     #[test]
     fn the_fallback_scan_runs_once_an_hour_has_passed() {
         let mut app = app_with(&[("One", &["A"])]);
-        app.config.music_directory = Some(std::env::temp_dir());
+        app.config.set_roots(vec![std::env::temp_dir()]);
         app.auto_scan = true;
         let ctx = egui::Context::default();
 
@@ -4764,7 +4828,7 @@ pub(crate) mod tests {
         let directory =
             std::env::temp_dir().join(format!("blue-dove-settle-{}", std::process::id()));
         std::fs::create_dir_all(&directory).expect("the directory is made");
-        app.config.music_directory = Some(directory.clone());
+        app.config.set_roots(vec![directory.clone()]);
         app.auto_scan = true;
         app.scanned_at = Some(Instant::now());
         let ctx = egui::Context::default();
@@ -4793,12 +4857,12 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&directory);
         std::fs::create_dir_all(&directory).expect("the directory is made");
         let mut app = app_with(&[("One", &["A"])]);
-        app.config.music_directory = Some(directory.clone());
+        app.config.set_roots(vec![directory.clone()]);
         app.auto_scan = true;
         app.scanned_at = Some(Instant::now());
         let ctx = egui::Context::default();
         app.poll_workers(&ctx);
-        if app.watch.is_none() {
+        if app.watches.is_empty() {
             // A host that cannot watch a directory has only the fallback.
             let _ = std::fs::remove_dir_all(&directory);
             return;
@@ -4832,14 +4896,14 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&directory);
         std::fs::create_dir_all(&directory).expect("the directory is made");
         let mut app = app_with(&[("One", &["A"])]);
-        app.config.music_directory = Some(directory.clone());
+        app.config.set_roots(vec![directory.clone()]);
         app.auto_scan = true;
         // The timer is not what this is about: what it would start would run
         // beside the watch and say nothing about it.
         app.scanned_at = Some(Instant::now());
         let ctx = egui::Context::default();
         app.poll_workers(&ctx);
-        if app.watch.is_none() {
+        if app.watches.is_empty() {
             // A host that cannot watch a directory has only the fallback.
             let _ = std::fs::remove_dir_all(&directory);
             return;
@@ -4847,13 +4911,11 @@ pub(crate) mod tests {
 
         std::fs::remove_dir_all(&directory).expect("the directory goes");
         let deadline = Instant::now() + Duration::from_secs(5);
-        while !app.watch.as_ref().is_some_and(crate::watch::Watch::ended)
-            && Instant::now() < deadline
-        {
+        while !app.watches.iter().any(crate::watch::Watch::ended) && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(10));
         }
         assert!(
-            app.watch.as_ref().is_some_and(crate::watch::Watch::ended),
+            app.watches.iter().any(crate::watch::Watch::ended),
             "the watch on the removed directory ended"
         );
 
@@ -4861,7 +4923,7 @@ pub(crate) mod tests {
         std::fs::create_dir_all(&directory).expect("the directory comes back");
         app.poll_workers(&ctx);
         assert!(
-            app.watch.as_ref().is_some_and(|watch| !watch.ended()),
+            app.watches.iter().any(|watch| !watch.ended()),
             "a live watch is placed on the directory that came back"
         );
 
@@ -4882,20 +4944,87 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn adding_a_directory_keeps_the_ones_before_it() {
+        let mut app = App::new(&egui::Context::default(), true, Vec::new());
+        let first = std::env::temp_dir().join(format!("blue-dove-add-{}", std::process::id()));
+        let second = std::env::temp_dir().join(format!("blue-dove-add-two-{}", std::process::id()));
+
+        app.add_directory(first.clone());
+        app.add_directory(second.clone());
+        app.add_directory(first.clone());
+
+        assert_eq!(
+            app.config.roots(),
+            [first, second],
+            "each directory is added once, and the order is kept"
+        );
+        assert!(app.scan.is_some(), "and the library is scanned again");
+    }
+
+    #[test]
+    fn removing_a_directory_leaves_the_others_scanned() {
+        let mut app = App::new(&egui::Context::default(), true, Vec::new());
+        let first = std::env::temp_dir().join(format!("blue-dove-keep-{}", std::process::id()));
+        let second = std::env::temp_dir().join(format!("blue-dove-drop-{}", std::process::id()));
+        app.config.set_roots(vec![first.clone(), second.clone()]);
+
+        app.remove_directory(&first);
+
+        assert_eq!(app.config.roots(), [second], "only the other is left");
+        assert!(app.scan.is_some(), "and what is left is scanned");
+    }
+
+    #[test]
+    fn removing_the_last_directory_leaves_the_window_as_it_is() {
+        // There is nothing left to scan, and blanking the album list under the
+        // user would take away the tracks they may have just queued.
+        let mut app = App::new(&egui::Context::default(), true, Vec::new());
+        let directory = std::env::temp_dir().join(format!("blue-dove-last-{}", std::process::id()));
+        app.config.set_roots(vec![directory.clone()]);
+
+        app.remove_directory(&directory);
+
+        assert!(app.config.roots().is_empty());
+        assert!(
+            app.scan.is_none(),
+            "nothing is scanned with nothing to scan"
+        );
+        assert!(
+            app.status.is_none(),
+            "and nothing is reported as having gone wrong"
+        );
+    }
+
+    #[test]
+    fn a_directory_left_out_of_the_scan_can_be_put_back() {
+        let mut app = App::new(&egui::Context::default(), true, Vec::new());
+        let directory = std::env::temp_dir().join(format!("blue-dove-in-{}", std::process::id()));
+        let left_out = std::env::temp_dir().join(format!("blue-dove-out-{}", std::process::id()));
+        app.config.set_roots(vec![directory]);
+
+        app.exclude_directory(left_out.clone());
+
+        assert_eq!(app.config.excluded(), std::slice::from_ref(&left_out));
+        assert!(app.scan.is_some(), "the library is read again without it");
+
+        app.include_directory(&left_out);
+
+        assert!(app.config.excluded().is_empty(), "it is scanned again");
+    }
+
+    #[test]
     fn a_watch_is_started_on_the_music_directory() {
         let mut app = app_with(&[("One", &["A"])]);
         let directory =
             std::env::temp_dir().join(format!("blue-dove-autoscan-{}", std::process::id()));
         std::fs::create_dir_all(&directory).expect("the directory is made");
-        app.config.music_directory = Some(directory.clone());
+        app.config.set_roots(vec![directory.clone()]);
         app.auto_scan = true;
 
         app.poll_workers(&egui::Context::default());
 
         assert!(
-            app.watch
-                .as_ref()
-                .is_some_and(|watch| watch.root() == directory),
+            app.watches.iter().any(|watch| watch.root() == directory),
             "the directory the library is read from is the one watched"
         );
         let _ = std::fs::remove_dir_all(&directory);
@@ -4904,20 +5033,20 @@ pub(crate) mod tests {
     #[test]
     fn turning_the_automatic_scan_off_stops_the_watch() {
         let mut app = app_with(&[("One", &["A"])]);
-        app.config.music_directory = Some(std::env::temp_dir());
+        app.config.set_roots(vec![std::env::temp_dir()]);
         app.auto_scan = true;
         app.poll_workers(&egui::Context::default());
 
         app.set_auto_scan(false);
         app.poll_workers(&egui::Context::default());
 
-        assert!(app.watch.is_none(), "nothing is watched with it off");
+        assert!(app.watches.is_empty(), "nothing is watched with it off");
     }
 
     #[test]
     fn the_automatic_scan_can_be_turned_off() {
         let mut app = app_with(&[("One", &["A"])]);
-        app.config.music_directory = Some(std::env::temp_dir());
+        app.config.set_roots(vec![std::env::temp_dir()]);
         app.set_auto_scan(false);
         app.scanned_at = None;
 
@@ -4932,7 +5061,7 @@ pub(crate) mod tests {
         // The setting covers the scan at startup and the one on a timer, so
         // waiting a minute for either would look as though it did nothing.
         let mut app = app_with(&[("One", &["A"])]);
-        app.config.music_directory = Some(std::env::temp_dir());
+        app.config.set_roots(vec![std::env::temp_dir()]);
 
         app.set_auto_scan(true);
 
@@ -5090,6 +5219,66 @@ pub(crate) mod tests {
         app.close_abx();
         assert!(app.abx.is_none());
         assert!(app.playing.is_none());
+    }
+
+    /// Every run of text a frame drew, so a test can say what a window shows.
+    fn drawn_text(output: &egui::FullOutput) -> Vec<String> {
+        fn walk(shape: &egui::epaint::Shape, into: &mut Vec<String>) {
+            match shape {
+                egui::epaint::Shape::Text(text) => into.push(text.galley.text().to_string()),
+                egui::epaint::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        walk(shape, into);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut text = Vec::new();
+        for clipped in &output.shapes {
+            walk(&clipped.shape, &mut text);
+        }
+        text
+    }
+
+    #[test]
+    fn the_sources_window_lists_what_is_scanned_and_what_is_left_out() {
+        let mut app = App::new(&egui::Context::default(), true, Vec::new());
+        app.config
+            .set_roots(vec![PathBuf::from("/music"), PathBuf::from("/mnt/rips")]);
+        app.config
+            .set_excluded(vec![PathBuf::from("/music/Christmas")]);
+        app.directories_open = true;
+
+        let ctx = egui::Context::default();
+        // A window needs a screen to be laid out in, and its size a frame to
+        // settle on, so the first one is drawn and thrown away.
+        let mut input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1024.0, 768.0),
+            )),
+            ..egui::RawInput::default()
+        };
+        let mut output = ctx.run_pass(input.clone(), |ctx| app.directories_window(ctx));
+        output.textures_delta.clear();
+        input.time = Some(0.1);
+        let mut output = ctx.run_pass(input, |ctx| app.directories_window(ctx));
+        output.textures_delta.clear();
+
+        let drawn = drawn_text(&output).join("\n");
+        assert!(
+            drawn.contains("/mnt/rips"),
+            "every source is listed:\n{drawn}"
+        );
+        assert!(
+            drawn.contains("/music/Christmas"),
+            "and so is every directory left out:\n{drawn}"
+        );
+        assert!(
+            drawn.contains("Add Directory"),
+            "the window says how to add another:\n{drawn}"
+        );
     }
 
     #[test]

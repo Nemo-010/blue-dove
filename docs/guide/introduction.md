@@ -1,8 +1,8 @@
 # Introduction
 
-Blue Dove is a music player for a directory of music files. Point it at the
-directory, and it lists what is there, grouped into albums by the tags the
-files already carry. There is no database to build, no files are copied
+Blue Dove is a music player for the directories your music sits in. Point it at
+one or several of them, and it lists what is there, grouped into albums by the
+tags the files already carry. There is no database to build, no files are copied
 or moved, and nothing leaves the machine.
 
 It replaces players such as Clementine, Strawberry and Elisa for
@@ -16,8 +16,10 @@ services. It does not stream, scrobble, sync devices or rip CDs.
   the formats video game rips use: Sony VAG, CRI ADX, and Nintendo DSP,
   BRSTM, BCSTM and BFSTM. Every decoder is pure Rust, so nothing has to be
   installed to play them.
-- Browses the directory as a tree of directories and albums, which can be
-  folded away, and queues an album or a whole directory into a playlist.
+- Browses the music as a tree of directories and albums, which can be folded
+  away, and queues an album or a whole directory into a playlist.
+- Reads several directories as one library, and leaves a directory out of the
+  scan without moving a file.
 - Keeps several playlists open as tabs, each with its own name, and
   remembers them between runs. A playlist that holds more than one album
   is drawn as a list of albums, each with its own heading.

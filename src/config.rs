@@ -1,4 +1,4 @@
-//! Settings kept between runs: the music directory, the volume and the
+//! Settings kept between runs: the music directories, the volume and the
 //! playlists that were open.
 
 use std::path::{Path, PathBuf};
@@ -11,12 +11,14 @@ use crate::error::At;
 #[derive(Debug, Default, Deserialize, Serialize)]
 #[serde(default)]
 pub struct Config {
-    /// Directory scanned at startup.
+    /// Directories scanned at startup, in the order they were added.
     ///
-    /// The name it was written under before the app called it a directory is
-    /// still read, so an older settings file keeps its music.
-    #[serde(alias = "music_folder")]
-    pub music_directory: Option<PathBuf>,
+    /// The names they were written under while the app scanned one directory
+    /// are still read, so an older settings file keeps its music.
+    #[serde(alias = "music_directory", alias = "music_folder")]
+    pub music_directories: Option<MusicDirectories>,
+    /// Directories the scan leaves out, with everything under them.
+    pub excluded_directories: Option<Vec<PathBuf>>,
     /// Output volume, from 0 to 1.
     pub volume: Option<f32>,
     /// Whether the window lets the desktop show through it.
@@ -58,6 +60,30 @@ pub struct Config {
     pub preview: Option<bool>,
 }
 
+/// The directories a settings file names, as one or as several.
+///
+/// The list arrived after the app scanned a single directory, and a settings
+/// file written before that spells the key as one path, so both are read and
+/// one is written.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum MusicDirectories {
+    /// One directory, as an older settings file spells it.
+    One(PathBuf),
+    /// The directories to scan, in the order they were added.
+    Many(Vec<PathBuf>),
+}
+
+impl MusicDirectories {
+    /// The directories it names.
+    pub fn all(&self) -> &[PathBuf] {
+        match self {
+            Self::One(directory) => std::slice::from_ref(directory),
+            Self::Many(directories) => directories,
+        }
+    }
+}
+
 /// A playlist as the settings file stores it.
 ///
 /// Tracks are kept by path rather than by index: the library is scanned
@@ -72,6 +98,30 @@ pub struct SavedPlaylist {
 }
 
 impl Config {
+    /// The directories the library is scanned from, in the order they were
+    /// added.
+    pub fn roots(&self) -> &[PathBuf] {
+        self.music_directories
+            .as_ref()
+            .map(MusicDirectories::all)
+            .unwrap_or_default()
+    }
+
+    /// The directories the scan leaves out, with everything under them.
+    pub fn excluded(&self) -> &[PathBuf] {
+        self.excluded_directories.as_deref().unwrap_or_default()
+    }
+
+    /// Remembers the directories to scan.
+    pub fn set_roots(&mut self, roots: Vec<PathBuf>) {
+        self.music_directories = Some(MusicDirectories::Many(roots));
+    }
+
+    /// Remembers the directories to leave out of the scan.
+    pub fn set_excluded(&mut self, excluded: Vec<PathBuf>) {
+        self.excluded_directories = Some(excluded);
+    }
+
     /// Reads the settings, falling back to defaults when there are none or
     /// they cannot be parsed.
     pub fn load() -> Self {
@@ -83,10 +133,16 @@ impl Config {
 
     /// Reads settings from `path`.
     pub fn load_from(path: &Path) -> Self {
-        std::fs::read_to_string(path)
+        let mut config: Self = std::fs::read_to_string(path)
             .ok()
             .and_then(|text| toml::from_str(&text).ok())
-            .unwrap_or_default()
+            .unwrap_or_default();
+        // A file that named one directory is written back as a list, so the
+        // next save does not keep the older spelling alive.
+        if let Some(MusicDirectories::One(directory)) = &config.music_directories {
+            config.music_directories = Some(MusicDirectories::Many(vec![directory.clone()]));
+        }
+        config
     }
 
     /// Writes the settings to the user's config directory.
@@ -123,7 +179,11 @@ mod tests {
             std::env::temp_dir().join(format!("blue-dove-config-{}", std::process::id()));
         let path = directory.join("nested").join("config.toml");
         let config = Config {
-            music_directory: Some(PathBuf::from("/music")),
+            music_directories: Some(MusicDirectories::Many(vec![
+                PathBuf::from("/music"),
+                PathBuf::from("/mnt/rips"),
+            ])),
+            excluded_directories: Some(vec![PathBuf::from("/music/Christmas")]),
             volume: Some(0.4),
             transparency: Some(true),
             repeat: Some(true),
@@ -158,7 +218,16 @@ mod tests {
         let loaded = Config::load_from(&path);
         std::fs::remove_dir_all(&directory).expect("the temporary directory is removed");
 
-        assert_eq!(loaded.music_directory, Some(PathBuf::from("/music")));
+        assert_eq!(
+            loaded.roots(),
+            [PathBuf::from("/music"), PathBuf::from("/mnt/rips")],
+            "the directories come back in the order they were added"
+        );
+        assert_eq!(
+            loaded.excluded(),
+            [PathBuf::from("/music/Christmas")],
+            "and so do the ones the scan leaves out"
+        );
         assert_eq!(loaded.volume, Some(0.4));
         assert_eq!(loaded.transparency, Some(true));
         assert_eq!(loaded.repeat, Some(true));
@@ -224,17 +293,42 @@ mod tests {
         std::fs::remove_dir_all(&directory).expect("the temporary directory is removed");
 
         assert_eq!(
-            loaded.music_directory,
-            Some(PathBuf::from("/music")),
+            loaded.roots(),
+            [PathBuf::from("/music")],
             "the older key is read as the directory to scan"
         );
+    }
+
+    #[test]
+    fn a_settings_file_naming_several_directories_reads_them_all() {
+        let directory =
+            std::env::temp_dir().join(format!("blue-dove-several-{}", std::process::id()));
+        let path = directory.join("config.toml");
+        std::fs::create_dir_all(&directory).expect("the directory is made");
+        std::fs::write(
+            &path,
+            "music_directories = [\"/music\", \"/mnt/rips\"]\n\
+             excluded_directories = [\"/music/Christmas\"]\n",
+        )
+        .expect("the file is written");
+
+        let loaded = Config::load_from(&path);
+        std::fs::remove_dir_all(&directory).expect("the temporary directory is removed");
+
+        assert_eq!(
+            loaded.roots(),
+            [PathBuf::from("/music"), PathBuf::from("/mnt/rips")],
+            "every directory is scanned, in the order the file names them"
+        );
+        assert_eq!(loaded.excluded(), [PathBuf::from("/music/Christmas")]);
     }
 
     #[test]
     fn a_missing_file_gives_defaults() {
         let missing = std::env::temp_dir().join("blue-dove-no-such-config.toml");
         let config = Config::load_from(&missing);
-        assert!(config.music_directory.is_none());
+        assert!(config.roots().is_empty());
+        assert!(config.excluded().is_empty());
         assert!(config.volume.is_none());
     }
 }
