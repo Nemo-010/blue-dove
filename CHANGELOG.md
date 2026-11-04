@@ -1,4 +1,10 @@
 
+## [0.1.15](https://github.com/pkgforge-apps/blue-dove/compare/v0.1.14...v0.1.15) - 2026-11-04
+
+### Features
+
+- Read several library sources and leave some out ([#54](https://github.com/pkgforge-apps/blue-dove/pull/54)) - ([a941093](https://github.com/pkgforge-apps/blue-dove/commit/a941093acfb09d06b6ff67675e42174995c9dc83))
+
 ## [0.1.14](https://github.com/pkgforge-apps/blue-dove/compare/v0.1.13...v0.1.14) - 2026-11-02
 
 ### Bug Fixes
