@@ -11,6 +11,7 @@ use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
 
 use eframe::egui;
+use winit::window::Window;
 
 use crate::abx::{Abx, Choice, Side};
 use crate::config::{Config, SavedPlaylist};
@@ -211,6 +212,16 @@ pub(crate) struct BigArt {
 
 /// Everything the window draws, and the state behind it.
 pub struct App {
+    /// The renderer the window is drawing through.
+    pub(crate) renderer: &'static str,
+    /// Whether the frame-rate counter is drawn.
+    pub(crate) show_fps: bool,
+    /// Frames per second, as last measured.
+    pub(crate) fps: f32,
+    /// Frames drawn since the last measurement.
+    fps_frames: u32,
+    /// When the last measurement started.
+    fps_last: Instant,
     /// Whether the window closes itself after [`SMOKE_FRAMES`] frames.
     pub(crate) smoke: bool,
     /// Whether settings are written to disk.
@@ -460,6 +471,11 @@ impl App {
             (Some(commands), Some(service))
         };
         let mut app = Self {
+            renderer: "OpenGL",
+            show_fps: false,
+            fps: 0.0,
+            fps_frames: 0,
+            fps_last: Instant::now(),
             smoke,
             persist: !smoke,
             frames: 0,
@@ -2441,7 +2457,7 @@ impl App {
     /// The service arrives on a channel of its own, since connecting to the
     /// bus takes a moment; until it does, this does nothing, and when the
     /// host has no bus at all it never does anything.
-    fn poll_mpris(&mut self, ctx: &egui::Context, frame: &eframe::Frame) {
+    fn poll_mpris(&mut self, ctx: &egui::Context, window: Option<&Window>) {
         let mut connected = false;
         if let Some(receiver) = &self.service
             && let Ok(service) = receiver.try_recv()
@@ -2468,7 +2484,7 @@ impl App {
             // to be shown again when a close left it hidden or minimized, and
             // only the frame holds the handle that does it.
             if command == Command::Raise {
-                self.raise_window(ctx, frame);
+                self.raise_window(ctx, window);
             } else {
                 self.apply(command);
             }
@@ -2542,7 +2558,7 @@ impl App {
     /// The audio runs on a thread of its own, so hiding leaves the music
     /// playing. Quit in the File menu still ends the app, and launching it
     /// again brings the window back.
-    fn handle_close(&mut self, ctx: &egui::Context, frame: &eframe::Frame) {
+    fn handle_close(&mut self, ctx: &egui::Context, window: Option<&Window>) {
         if !ctx.input(|input| input.viewport().close_requested()) {
             return;
         }
@@ -2553,7 +2569,7 @@ impl App {
         // The window itself is asked, rather than a viewport command left for
         // eframe to apply after the pass: this way it leaves the screen as
         // the close was clicked, not a frame later.
-        match (frame.winit_window(), on_wayland()) {
+        match (window, on_wayland()) {
             // Wayland has no request that hides a window: the compositor owns
             // visibility, and winit ignores `set_visible` there. `xdg_toplevel`
             // does have `set_minimized`, so that is what a close asks for, and
@@ -2567,7 +2583,7 @@ impl App {
     }
 
     /// Brings the window back when another launch asked for it.
-    fn poll_requests(&mut self, ctx: &egui::Context, frame: &eframe::Frame) {
+    fn poll_requests(&mut self, ctx: &egui::Context, window: Option<&Window>) {
         let Some(receiver) = &self.requests else {
             return;
         };
@@ -2584,7 +2600,7 @@ impl App {
         // remote control would keep reporting the old state.
         ctx.request_repaint();
         if raise {
-            self.raise_window(ctx, frame);
+            self.raise_window(ctx, window);
         }
     }
 
@@ -2618,8 +2634,8 @@ impl App {
     }
 
     /// Brings the window back to the screen.
-    fn raise_window(&self, ctx: &egui::Context, frame: &eframe::Frame) {
-        match frame.winit_window() {
+    fn raise_window(&self, ctx: &egui::Context, window: Option<&Window>) {
+        match window {
             Some(window) => {
                 window.set_visible(true);
                 window.set_minimized(false);
@@ -2911,6 +2927,43 @@ impl App {
         }
     }
 
+    /// Counts frames and draws the counter when `--fps` asked for it.
+    ///
+    /// The counter keeps asking for repaints, so the number is the rate the
+    /// backend can actually draw at rather than the rate something happened
+    /// to ask for a frame.
+    fn tick_fps(&mut self, ctx: &egui::Context) {
+        self.fps_frames += 1;
+        let now = Instant::now();
+        let elapsed = now.duration_since(self.fps_last);
+        if elapsed >= Duration::from_secs(1) {
+            self.fps = self.fps_frames as f32 / elapsed.as_secs_f32();
+            self.fps_frames = 0;
+            self.fps_last = now;
+            if self.show_fps {
+                eprintln!("blue-dove: {:.1} fps", self.fps);
+            }
+        }
+        if !self.show_fps {
+            return;
+        }
+        egui::Area::new(egui::Id::unique("fps"))
+            .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-8.0, 8.0))
+            .show(ctx, |ui| {
+                egui::Frame::NONE
+                    .fill(egui::Color32::from_black_alpha(160))
+                    .inner_margin(egui::Margin::symmetric(6, 2))
+                    .show(ui, |ui| {
+                        ui.label(
+                            egui::RichText::new(format!("{:.1} fps", self.fps))
+                                .monospace()
+                                .color(egui::Color32::WHITE),
+                        );
+                    });
+            });
+        ctx.request_repaint();
+    }
+
     /// Closes the window after a few frames when running a smoke test.
     fn tick_smoke(&mut self, ctx: &egui::Context) {
         if !self.smoke {
@@ -3055,46 +3108,27 @@ impl App {
     }
 }
 
-impl eframe::App for App {
-    /// The colour the renderer clears to.
-    ///
-    /// A translucent window clears to nothing, so the panels' own alpha is
-    /// what the compositor blends with the desktop behind the window.
-    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
-        if self.transparency {
-            [0.0, 0.0, 0.0, 0.0]
-        } else {
-            egui::Color32::from_rgb(0x12, 0x12, 0x18).to_normalized_gamma_f32()
-        }
-    }
-
-    /// Writes the settings one last time as the window closes.
-    ///
-    /// Playlists are saved as they change, so this is for what changes
-    /// without a save of its own: the selected track, and the volume if the
-    /// slider was never let go.
-    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
-        self.save_playlists();
-    }
-
-    /// Runs the player, which a hidden window still needs.
+impl App {
+    /// Runs the player for one pass, without drawing.
     ///
     /// eframe calls this before each drawing pass, and on its own while the
     /// window is hidden: without it a track that ran out would sit there, and
-    /// a launch that asks for the window would go unheard.
-    fn logic(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+    /// a launch that asks for the window would go unheard. The software
+    /// fallback calls it the same way.
+    pub fn run_logic(&mut self, ctx: &egui::Context, window: Option<&Window>) {
         self.poll_workers(ctx);
         // Requests are taken before the remote control is published, so a
         // command from the command line shows up in MPRIS in the same frame
         // rather than a frame later.
-        self.poll_requests(ctx, frame);
-        self.poll_mpris(ctx, frame);
+        self.poll_requests(ctx, window);
+        self.poll_mpris(ctx, window);
         self.take_dropped_files(ctx);
-        self.handle_close(ctx, frame);
+        self.handle_close(ctx, window);
         self.advance(ctx);
     }
 
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+    /// Draws the window for one pass.
+    pub fn draw(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         self.handle_keys(&ctx);
         self.update_layout(&ctx);
@@ -3160,7 +3194,39 @@ impl eframe::App for App {
         self.abx_window(&ctx);
         self.directories_window(&ctx);
 
+        self.tick_fps(&ctx);
         self.tick_smoke(&ctx);
+    }
+}
+
+impl eframe::App for App {
+    /// The colour the renderer clears to.
+    ///
+    /// A translucent window clears to nothing, so the panels' own alpha is
+    /// what the compositor blends with the desktop behind the window.
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        if self.transparency {
+            [0.0, 0.0, 0.0, 0.0]
+        } else {
+            egui::Color32::from_rgb(0x12, 0x12, 0x18).to_normalized_gamma_f32()
+        }
+    }
+
+    /// Writes the settings one last time as the window closes.
+    ///
+    /// Playlists are saved as they change, so this is for what changes
+    /// without a save of its own: the selected track, and the volume if the
+    /// slider was never let go.
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.save_playlists();
+    }
+
+    fn logic(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        self.run_logic(ctx, frame.winit_window().map(|window| &**window));
+    }
+
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.draw(ui);
     }
 }
 

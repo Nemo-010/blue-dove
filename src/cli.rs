@@ -8,6 +8,26 @@
 
 use std::path::PathBuf;
 
+/// The renderer a launch asked for.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Renderer {
+    /// The GPU path through glow/OpenGL.
+    #[default]
+    OpenGl,
+    /// The CPU renderer.
+    Software,
+}
+
+impl Renderer {
+    /// The command line flag that names this renderer.
+    pub fn flag(self) -> &'static str {
+        match self {
+            Self::OpenGl => "--opengl",
+            Self::Software => "--software",
+        }
+    }
+}
+
 /// What a launch was asked to do.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Cli {
@@ -15,6 +35,12 @@ pub struct Cli {
     pub paths: Vec<PathBuf>,
     /// The transport command, when one was given.
     pub action: Option<Action>,
+    /// Whether to show the frame-rate counter.
+    pub fps: bool,
+    /// Whether to disable vsync on the GPU renderer.
+    pub no_vsync: bool,
+    /// The renderer the launch asked for, when it named one.
+    pub renderer: Option<Renderer>,
 }
 
 /// A transport command given on the command line.
@@ -130,6 +156,10 @@ Options:
       --stop       Stop playback
       --next       Play the next track
       --previous   Play the previous track
+      --fps        Show a frame-rate counter
+      --no-vsync   Disable vsync on the GPU renderer
+      --opengl     Draw through OpenGL (the default)
+      --software   Draw with the CPU renderer
 
 A command goes to the player that is already running, and starts nothing.
 With no player running, a PATH opens the window and a bare command says
@@ -146,6 +176,32 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Parsed {
         if !rest_are_paths {
             match arg.as_str() {
                 "--smoke" => continue,
+                "--fps" => {
+                    cli.fps = true;
+                    continue;
+                }
+                "--no-vsync" => {
+                    cli.no_vsync = true;
+                    continue;
+                }
+                "--opengl" | "--software" => {
+                    let renderer = if arg == "--opengl" {
+                        Renderer::OpenGl
+                    } else {
+                        Renderer::Software
+                    };
+                    if let Some(previous) = cli.renderer
+                        && previous != renderer
+                    {
+                        return Parsed::Error(format!(
+                            "{} and {} cannot both be given",
+                            previous.flag(),
+                            renderer.flag()
+                        ));
+                    }
+                    cli.renderer = Some(renderer);
+                    continue;
+                }
                 "-h" | "--help" => return Parsed::Help,
                 "-V" | "--version" => return Parsed::Version,
                 "--" => {
@@ -214,6 +270,29 @@ mod tests {
     #[test]
     fn no_arguments_ask_for_a_window() {
         assert_eq!(run(&[]), Cli::default());
+    }
+
+    #[test]
+    fn the_fps_flag_asks_for_the_counter() {
+        assert!(run(&["--fps"]).fps);
+        assert!(!run(&[]).fps);
+    }
+
+    #[test]
+    fn the_no_vsync_flag_asks_for_no_vsync() {
+        assert!(run(&["--no-vsync"]).no_vsync);
+        assert!(!run(&[]).no_vsync);
+    }
+
+    #[test]
+    fn each_renderer_flag_names_its_renderer() {
+        assert_eq!(run(&["--opengl"]).renderer, Some(Renderer::OpenGl));
+        assert_eq!(run(&["--software"]).renderer, Some(Renderer::Software));
+        assert_eq!(run(&[]).renderer, None);
+        assert_eq!(
+            parse_args(&["--opengl", "--software"]),
+            Parsed::Error("--opengl and --software cannot both be given".to_string())
+        );
     }
 
     #[test]

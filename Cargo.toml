@@ -17,8 +17,11 @@ appimage = true
 
 [dependencies]
 ape-decoder = "0.3.2"
+bytemuck = "1"
 dirs = "7.0.0"
 eframe = { version = "0.37.0", default-features = false, features = ["clipboard", "default_fonts", "glow", "links", "wayland", "x11"] }
+egui-winit = { version = "0.37", default-features = false, features = ["clipboard", "links", "wayland", "x11"] }
+egui_software_backend = { version = "=0.2.0", package = "hdrshot-egui-backend" }
 lofty = "0.25.4"
 notify = "8"
 ogg = "0.9.2"
@@ -32,10 +35,12 @@ rfd = { version = "0.17.2", default-features = false, features = ["xdg-portal", 
 rodio = { version = "0.23.0", default-features = false, features = ["flac", "mp3", "mp4", "playback", "symphonia-adpcm", "symphonia-aiff", "symphonia-alac", "symphonia-caf", "symphonia-mkv", "symphonia-mp1", "symphonia-mp2", "vorbis", "wav"] }
 rvoip-codec-core = { version = "0.4.0", default-features = false, features = ["amr"] }
 serde = { version = "1.0.229", features = ["derive"] }
+softbuffer = { version = "0.4", default-features = false, features = ["x11", "x11-dlopen", "wayland", "wayland-dlopen"] }
 toml = "1.1.8"
 unicode-normalization = "0.1.26"
 walkdir = "2.5.0"
 wavicle = "0.1.0"
+winit = { version = "0.30", default-features = false, features = ["x11", "wayland", "rwh_06"] }
 zbus = "5"
 zune-jpeg = "0.5.15"
 

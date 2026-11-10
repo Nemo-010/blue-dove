@@ -8,8 +8,9 @@
 # set, the .zsync its self-updater reads. Runs as root on Arch with the
 # Anylinux tools and the debloated packages installed, after `cargo build
 # --release --locked`; the release workflow sets that up. The image
-# carries glibc, the loader, Mesa and every library the binary loads, all
-# from the build host.
+# carries glibc, the loader and every library the binary loads, all from the
+# build host. The GL stack is the host's: the app falls back to its own CPU
+# renderer when the host has none, so Mesa is not bundled.
 set -eu
 cd "$(dirname "$0")/.."
 
@@ -42,10 +43,10 @@ export VERSION="$version"
 export DESKTOP="$PWD/packaging/linux/app.desktop"
 export ICON="$PWD/assets/icons/256.png"
 
-# Detection alone bundles GLX and gallium but no libEGL, no dri/ and no
-# gbm, which leaves no Wayland path and no driver behind the GL it does
-# carry.
-export DEPLOY_OPENGL=1
+# The app draws through the host's GL when it has one and falls back to its
+# own CPU renderer when it does not, so ship no GPU drivers: quick-sharun
+# leaves the driver bits on the host and cross-libc-dlopen loads them.
+export USE_HOST_DRIVERS_EXPERIMENTAL=1
 
 if [ -n "${GITHUB_REPOSITORY:-}" ]; then
     export UPINFO="gh-releases-zsync|${GITHUB_REPOSITORY%/*}|${GITHUB_REPOSITORY#*/}|latest|*$platform.AppImage.zsync"
@@ -54,14 +55,6 @@ fi
 
 rm -rf "$APPDIR"
 quick-sharun "/usr/bin/$app"
-
-# A host with Mesa makes up for a bundle without it, so no test run would
-# catch these missing.
-if [ -z "$(find "$APPDIR" -name libEGL.so.1)" ] ||
-    [ -z "$(find "$APPDIR" -type d -name dri)" ]; then
-    echo "the AppDir has no libEGL.so.1 or no dri/" >&2
-    exit 1
-fi
 
 quick-sharun --make-appimage
 rm -rf "$APPDIR" dist/appinfo

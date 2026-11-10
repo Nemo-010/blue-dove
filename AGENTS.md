@@ -114,10 +114,14 @@ version and the changelog groups, so pick them carefully:
   only when the work is genuinely async-heavy.
 - Repaint on demand. Do not request continuous repaints unless
   something is animating.
-- The renderer is glow (OpenGL). Keep eframe's default features off and
-  enable only what the app uses.
+- The renderer is glow (OpenGL), with a CPU fallback in `src/software.rs`
+  for hosts with no usable GL. `--opengl` and `--software` force either
+  one; `BLUE_DOVE_SOFTWARE=1` is the same switch for wrappers that cannot
+  pass `--software`. Keep eframe's default features off and enable only
+  what the app uses.
 - Keep the `--smoke` flag working. CI and the release pipeline launch
-  every build with it to prove the app opens a window and draws.
+  every build with it to prove the app opens a window and draws. It runs
+  the software fallback, so CI exercises the path a host with no GL takes.
 
 ### smudge apps
 
@@ -196,13 +200,14 @@ linked in, and the `.onelf` and `.AppImage` are single files. No
 checksum files are published; every asset carries a build provenance
 attestation instead.
 
-The onelf bundle uses the stipplefs payload. An egui app's bundle
-carries Mesa, so it draws on hosts without a usable GL stack, musl
-distributions included; NVIDIA's driver still comes from the host. It
-is the Mesa [onelf-pkgs/mesa](https://github.com/onelf-pkgs/mesa) builds
-without LLVM, which adds about 8 MB; do not drop it to save space. A smudge
-app drawing with its CPU renderer needs no GL, so it turns `gl` and
-`dri` off in `onelf.toml`; confirm with the `test-linux-bundle` skill.
+The onelf bundle uses the stipplefs payload. It carries no Mesa: the app
+draws through the host's GL when it has one, and falls back to its own CPU
+renderer in `src/software.rs` when it does not, so musl distributions,
+minimal VMs and containers still get a window. `onelf.toml` turns `gl` and
+`dri` off and excludes the GL stack from the scan; the AppImage sets
+`USE_HOST_DRIVERS_EXPERIMENTAL=1` so quick-sharun leaves the drivers on the
+host. Confirm with the `test-linux-bundle`
+skill, which has a no-GL container for exactly this case.
 
 The onelf bundle updates itself with `--onelf-update`, downloading only
 what changed since the copy it replaces. Once the app has its update key
@@ -804,9 +809,12 @@ Platform notes:
   around 1.5 MB, which the size budget for this app does not allow, so
   the window has no screen-reader support.
 - The release binary is kept under 14 MB. Weigh it after a change that
-  adds a dependency or a decoder; `strip`, fat LTO, `panic = "abort"`
-  and one codegen unit are already on, and `opt-level` stays at the
-  default rather than `"s"`.
+  adds a dependency or a decoder; `strip`, fat LTO and one codegen unit
+  are already on, and `opt-level` stays at the default rather than `"s"`.
+  `panic = "unwind"` is deliberate: a broken host GL stack can panic
+  inside winit while it maps the window, and the CPU fallback catches
+  that panic. The unwind tables cost about 0.5 MB compressed; a crash
+  with no fallback costs the user the whole app.
 
 The AppImage is built by the shared release job, which `Cargo.toml` opts
 into with `appimage = true` under `[package.metadata.pkgforge]`. It

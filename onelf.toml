@@ -17,15 +17,13 @@ payload = "stipple"
 [bundle]
 strip = true
 scan-dlopen = true
-# Mesa from the build host, so the app draws on hosts with no usable GL:
-# musl distributions, minimal VMs and containers. NVIDIA's driver still
-# comes from the host when it is installed.
-gl = true
-dri = true
 # winit draws its own Wayland decorations and never loads libdecor, whose
 # GTK plugin would otherwise pull GTK, cairo and pango into the bundle.
 no-gtk = true
-exclude = ["libdecor"]
+# The app draws through the host's GL when it has one and falls back to its
+# own CPU renderer when it does not, so the bundle carries no Mesa. The
+# exclude list keeps the scan from pulling the GL stack in by name.
+exclude = ["libdecor", "libgallium", "libGL", "libEGL", "libGLX", "libGLdispatch", "libgbm", "libdrm"]
 # winit and xkbcommon-dl load the X11 stack by name at runtime, so the
 # string scan cannot see it. libasound is what cpal links; the ALSA
 # plugins behind it load the audio servers, which are bundled here so the

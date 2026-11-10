@@ -679,6 +679,7 @@ impl App {
 
                 ui.menu_button("Help", |ui| {
                     ui.label(format!("{} {}", Self::TITLE, env!("CARGO_PKG_VERSION")));
+                    ui.label(format!("Renderer: {}", self.renderer));
                     ui.label("Plays the music in the directories you add.");
                     ui.hyperlink_to(
                         "Documentation",
