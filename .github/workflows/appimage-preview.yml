@@ -1,0 +1,85 @@
+name: appimage-preview
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Branch to build
+        required: true
+        default: software-fallback
+
+permissions:
+  contents: write
+
+jobs:
+  appimage:
+    runs-on: ubuntu-24.04
+    container:
+      image: ghcr.io/pkgforge-dev/archlinux:latest@sha256:782f92dd4cd2adee5544ec7fc53d06a9168489041fae13271b418123c858d5e7
+    env:
+      VERSION: 0.1.15-preview
+      PLATFORM: anylinux-x86_64
+      QUICK_SHARUN: https://raw.githubusercontent.com/pkgforge-dev/Anylinux-AppImages/c28bb80743106fdf08cb10fb27d19d9932eb0865/useful-tools/quick-sharun.sh
+      DEBLOATED_PACKAGES: https://raw.githubusercontent.com/pkgforge-dev/Anylinux-AppImages/c28bb80743106fdf08cb10fb27d19d9932eb0865/useful-tools/get-debloated-pkgs.sh
+      MAKE_AUR_PACKAGE: https://raw.githubusercontent.com/pkgforge-dev/Anylinux-AppImages/c28bb80743106fdf08cb10fb27d19d9932eb0865/useful-tools/make-aur-package.sh
+    steps:
+      - uses: pkgforge-dev/anylinux-setup-action@ba7321e11074f9e387a0634e653d09b115d576cd
+      - name: Install build packages
+        run: |
+          retry() {
+            attempt=0
+            while ! "$@"; do
+              attempt=$((attempt + 1))
+              if [ "$attempt" -ge 3 ]; then
+                echo "$* failed $attempt times" >&2
+                return 1
+              fi
+              echo "$* failed, retrying ($attempt/3)" >&2
+              sleep 10
+            done
+          }
+          retry pacman -S --noconfirm --needed rustup wayland libxkbcommon \
+            libxkbcommon-x11 libx11 libxcursor libxi libxrandr xorg-xauth github-cli
+          get-debloated-pkgs --add-common --prefer-nano
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+      - name: Install the system libraries this app links against
+        run: |
+          file=.github/pacman-packages.txt
+          [ -f "$file" ] || exit 0
+          packages=$(sed -e 's/#.*//' "$file" | xargs)
+          [ -n "$packages" ] || exit 0
+          retry() {
+            attempt=0
+            while ! "$@"; do
+              attempt=$((attempt + 1))
+              if [ "$attempt" -ge 3 ]; then
+                echo "$* failed $attempt times" >&2
+                return 1
+              fi
+              echo "$* failed, retrying ($attempt/3)" >&2
+              sleep 10
+            done
+          }
+          retry pacman -S --disable-sandbox --noconfirm --needed $packages
+      - run: rustup default stable
+      - run: cargo build --release --locked
+      - run: sh scripts/package-appimage.sh "$PLATFORM" "$VERSION"
+      - name: Smoke run the AppImage
+        run: xvfb-run -a timeout 60 dist/*.AppImage --smoke
+      - name: Publish the preview release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if gh release view preview-software-fallback --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload preview-software-fallback dist/*.AppImage \
+              --repo "$GITHUB_REPOSITORY" --clobber
+          else
+            gh release create preview-software-fallback dist/*.AppImage \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "Preview: software fallback" \
+              --notes "AppImage built from ${{ inputs.ref }}." \
+              --prerelease
+          fi
